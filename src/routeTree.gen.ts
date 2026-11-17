@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as LayoutRouteImport } from './routes/_layout'
 import { Route as LayoutIndexRouteImport } from './routes/_layout.index'
+import { Route as LayoutCategoriesRouteImport } from './routes/_layout.categories'
 import { Route as LayoutVideosIdRouteImport } from './routes/_layout.videos.$id'
 
 const LayoutRoute = LayoutRouteImport.update({
@@ -22,6 +23,11 @@ const LayoutIndexRoute = LayoutIndexRouteImport.update({
   path: '/',
   getParentRoute: () => LayoutRoute,
 } as any)
+const LayoutCategoriesRoute = LayoutCategoriesRouteImport.update({
+  id: '/categories',
+  path: '/categories',
+  getParentRoute: () => LayoutRoute,
+} as any)
 const LayoutVideosIdRoute = LayoutVideosIdRouteImport.update({
   id: '/videos/$id',
   path: '/videos/$id',
@@ -30,24 +36,32 @@ const LayoutVideosIdRoute = LayoutVideosIdRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof LayoutIndexRoute
+  '/categories': typeof LayoutCategoriesRoute
   '/videos/$id': typeof LayoutVideosIdRoute
 }
 export interface FileRoutesByTo {
+  '/categories': typeof LayoutCategoriesRoute
   '/': typeof LayoutIndexRoute
   '/videos/$id': typeof LayoutVideosIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_layout': typeof LayoutRouteWithChildren
+  '/_layout/categories': typeof LayoutCategoriesRoute
   '/_layout/': typeof LayoutIndexRoute
   '/_layout/videos/$id': typeof LayoutVideosIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/videos/$id'
+  fullPaths: '/' | '/categories' | '/videos/$id'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/videos/$id'
-  id: '__root__' | '/_layout' | '/_layout/' | '/_layout/videos/$id'
+  to: '/categories' | '/' | '/videos/$id'
+  id:
+    | '__root__'
+    | '/_layout'
+    | '/_layout/categories'
+    | '/_layout/'
+    | '/_layout/videos/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -70,6 +84,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LayoutIndexRouteImport
       parentRoute: typeof LayoutRoute
     }
+    '/_layout/categories': {
+      id: '/_layout/categories'
+      path: '/categories'
+      fullPath: '/categories'
+      preLoaderRoute: typeof LayoutCategoriesRouteImport
+      parentRoute: typeof LayoutRoute
+    }
     '/_layout/videos/$id': {
       id: '/_layout/videos/$id'
       path: '/videos/$id'
@@ -81,11 +102,13 @@ declare module '@tanstack/react-router' {
 }
 
 interface LayoutRouteChildren {
+  LayoutCategoriesRoute: typeof LayoutCategoriesRoute
   LayoutIndexRoute: typeof LayoutIndexRoute
   LayoutVideosIdRoute: typeof LayoutVideosIdRoute
 }
 
 const LayoutRouteChildren: LayoutRouteChildren = {
+  LayoutCategoriesRoute: LayoutCategoriesRoute,
   LayoutIndexRoute: LayoutIndexRoute,
   LayoutVideosIdRoute: LayoutVideosIdRoute,
 }

@@ -1,6 +1,7 @@
 // 顶部玻璃导航栏：Logo + 搜索框 + 上传按钮；移动端搜索框收缩为图标展开式
 import { useEffect, useRef, useState } from "react";
-import { Clapperboard, Search, Upload, X } from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import { Clapperboard, FolderTree, Search, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -53,6 +54,15 @@ export function TopBar({ search, onSearchChange, onUploadClick }: TopBarProps) {
         </div>
 
         <div className="flex flex-1 items-center justify-end gap-2 md:flex-none">
+          <Link
+            to="/categories"
+            aria-label="分类与标签"
+            className="inline-flex h-10 items-center gap-1.5 rounded-full border border-border/70 bg-card/70 px-3 text-sm font-medium text-muted-foreground transition-colors hover:border-film/40 hover:text-foreground sm:px-4"
+          >
+            <FolderTree className="h-4 w-4" />
+            <span className="hidden sm:inline">分类·标签</span>
+          </Link>
+
           {/* 移动端搜索开关 */}
           <Button
             variant="ghost"

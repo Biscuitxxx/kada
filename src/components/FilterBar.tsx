@@ -1,6 +1,8 @@
-// 分类横向滚动胶囊 + 排序/视图切换工具行
-import { LayoutGrid, List, Settings2 } from "lucide-react";
+// 分类筛选条（永远单行，超出横向滚动）+ 排序/视图/多选工具行
+// 标签筛选不再常驻首页：从「分类与标签」页点标签进来时，只在工具行显示一条可清除的提示
+import { CheckSquare, LayoutGrid, List, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { CategoryChipMenu } from "@/components/CategoryChipMenu";
 import type { FilterBarProps } from "@/types";
 
 const SORT_LABELS: Record<FilterBarProps["sort"], string> = {
@@ -13,55 +15,95 @@ const SORT_CYCLE = ["newest", "oldest", "title"] as const;
 
 export function FilterBar({
   categories,
+  categoryCounts,
+  onCreateCategory,
+  onDeleteCategory,
   activeCategoryId,
   onSelectCategory,
+  activeTag,
+  onClearTag,
   sort,
   onSortChange,
   view,
   onViewChange,
-  onManageCategories,
   resultCount,
+  selecting,
+  onToggleSelecting,
+  selectedCount,
 }: FilterBarProps) {
   return (
     <div className="space-y-3">
-      {/* 分类胶囊条：移动端横向滚动 */}
-      <div className="no-scrollbar -mx-4 flex gap-2 overflow-x-auto px-4 pb-1 sm:mx-0 sm:px-0">
-        <button
-          type="button"
-          className="chip"
-          data-active={activeCategoryId === "all"}
-          onClick={() => onSelectCategory("all")}
-        >
-          全部
-        </button>
-        {categories.map((c) => (
+      {/* 分类胶囊条：始终单行，分类再多也只是横向滚动；末尾固定的「+」用来新建 / 删除分类 */}
+      <div className="flex items-center gap-1.5 pb-1">
+        <div className="no-scrollbar -mx-4 flex min-w-0 flex-1 flex-nowrap items-center gap-2 overflow-x-auto px-4 sm:mx-0 sm:px-0">
           <button
-            key={c.id}
             type="button"
-            className="chip"
-            data-active={activeCategoryId === c.id}
-            onClick={() => onSelectCategory(c.id)}
+            className="chip shrink-0 whitespace-nowrap"
+            data-active={activeCategoryId === "all"}
+            onClick={() => onSelectCategory("all")}
           >
-            {c.name}
+            全部
           </button>
-        ))}
-        <button
-          type="button"
-          onClick={onManageCategories}
-          className="chip !border-dashed text-muted-foreground"
-          aria-label="管理分类"
-        >
-          <Settings2 className="h-3.5 w-3.5" />
-          管理
-        </button>
+          {categories.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              className="chip shrink-0 whitespace-nowrap"
+              data-active={activeCategoryId === c.id}
+              onClick={() => onSelectCategory(c.id)}
+            >
+              {c.name}
+            </button>
+          ))}
+        </div>
+        {onCreateCategory && onDeleteCategory && (
+          <CategoryChipMenu
+            categories={categories}
+            counts={categoryCounts}
+            onCreate={onCreateCategory}
+            onDelete={onDeleteCategory}
+            onSelect={onSelectCategory}
+          />
+        )}
       </div>
 
       {/* 工具行 */}
-      <div className="flex items-center justify-between">
-        <p className="text-sm text-muted-foreground">
-          共 <span className="font-semibold tabular-nums text-foreground">{resultCount}</span> 个视频
-        </p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <p className="text-sm text-muted-foreground">
+            共{" "}
+            <span className="font-semibold tabular-nums text-foreground">{resultCount}</span> 个视频
+            {selecting && <span className="ml-2 text-film">已选 {selectedCount} 个</span>}
+          </p>
+          {activeTag && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-film/25 bg-film/10 py-0.5 pl-2.5 pr-1 text-xs font-medium text-film">
+              标签：#{activeTag.name}
+              <button
+                type="button"
+                aria-label={`清除标签筛选 ${activeTag.name}`}
+                className="grid h-5 w-5 place-items-center rounded-full text-film/70 transition-colors hover:bg-film/15 hover:text-film"
+                onClick={onClearTag}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          )}
+        </div>
         <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={onToggleSelecting}
+            aria-pressed={selecting}
+            className={cn(
+              "inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium transition-colors",
+              selecting
+                ? "border-film bg-film text-primary-foreground"
+                : "border-border bg-card text-muted-foreground hover:border-film/40 hover:text-foreground",
+            )}
+          >
+            <CheckSquare className="h-3.5 w-3.5" />
+            {selecting ? "退出多选" : "多选"}
+          </button>
           <button
             type="button"
             onClick={() => {

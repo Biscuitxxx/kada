@@ -1,4 +1,4 @@
-// 视频详情页：在线播放 + 元信息 + 下载/编辑/删除（独立页面，不嵌套列表）
+// 视频详情页：在线播放 + 元信息 + 标签 + 下载/编辑/删除（独立页面，不嵌套列表）
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import {
@@ -8,9 +8,11 @@ import {
   FileVideo,
   HardDrive,
   Pencil,
+  Plus,
   Tag,
   Timer,
   Trash2,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -36,6 +38,8 @@ import {
   type VideoRow,
 } from "@/lib/site";
 import { VideoEditDialog } from "@/components/VideoEditDialog";
+import { TagPickerDialog } from "@/components/TagPickerDialog";
+import { RemovableTagPill } from "@/components/TagPill";
 import { useLayoutContext } from "@/lib/layout-context";
 
 export const Route = createFileRoute("/_layout/videos/$id")({
@@ -52,6 +56,7 @@ function VideoDetailPage() {
   const [notFound, setNotFound] = useState(false);
   const [playError, setPlayError] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+  const [tagPickerOpen, setTagPickerOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
   const load = useCallback(async () => {
@@ -81,6 +86,23 @@ function VideoDetailPage() {
     return attachVolumeMemory(el);
   }, [row?.id]);
 
+  // 网页版还在转的时候轮询一下，转完自动换成可播的那份
+  const proxyPending = row?.proxy_status === "pending" || row?.proxy_status === "processing";
+  useEffect(() => {
+    if (!proxyPending) return;
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      tries += 1;
+      fetchVideoById(id)
+        .then((next) => {
+          if (next && next.proxy_status !== row?.proxy_status) setRow(next);
+        })
+        .catch(() => {});
+      if (tries >= 24) window.clearInterval(timer);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [proxyPending, id, row?.proxy_status]);
+
   if (loading) {
     return (
       <div className="space-y-4">
@@ -109,12 +131,32 @@ function VideoDetailPage() {
 
   const categoryName =
     (row.category_id && library.categories.find((c) => c.id === row.category_id)?.name) || "未分类";
-  const src = publicUrl(row.storage_path);
+  // 有网页版就播网页版（H.264），否则播原片；下载永远给原片
+  const src = publicUrl(row.proxy_path || row.storage_path);
+  const downloadSrc = publicUrl(row.storage_path);
+  const proxyFailed = row.proxy_status === "failed";
+  const tagIds = row.tag_ids ?? [];
+  const rowTags = tagIds
+    .map((tid) => library.tags.find((t) => t.id === tid))
+    .filter((t): t is NonNullable<typeof t> => Boolean(t));
+
+  const removeTag = async (tagId: string) => {
+    try {
+      await library.removeTagFromVideos([row.id], [tagId]);
+      setRow((prev) =>
+        prev ? { ...prev, tag_ids: (prev.tag_ids ?? []).filter((id) => id !== tagId) } : prev,
+      );
+      toast.success("已移除标签");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "移除失败");
+    }
+  };
+
 
   const doDownload = () => {
     try {
       const a = document.createElement("a");
-      a.href = src;
+      a.href = downloadSrc;
       a.download = row.original_name || row.title;
       a.rel = "noopener";
       document.body.appendChild(a);
@@ -139,7 +181,7 @@ function VideoDetailPage() {
   };
 
   const confirmDelete = async () => {
-    const view = { ...row, categoryName };
+    const view = { ...row, categoryName, tags: rowTags };
     setDeleteOpen(false);
     await library.remove(view);
     void navigate({ to: "/" });
@@ -180,6 +222,17 @@ function VideoDetailPage() {
         )}
       </div>
 
+      {proxyPending && (
+        <p className="rounded-2xl border border-film/30 bg-film/5 px-4 py-3 text-xs leading-relaxed text-muted-foreground">
+          这支视频是浏览器解不了的编码（比如 HEVC），服务端正在生成网页能播的 H.264 版本，转好后这个页面会自动变成可播放。原片不会被替换，随时可以下载。
+        </p>
+      )}
+      {proxyFailed && (
+        <p className="rounded-2xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-xs leading-relaxed text-destructive">
+          网页版没转成功，点「下载」用本地播放器观看即可。
+        </p>
+      )}
+
       {/* 标题与操作 */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
@@ -212,6 +265,41 @@ function VideoDetailPage() {
         </div>
       </div>
 
+      {/* 标签：展示 + 单条增删 */}
+      <div className="rounded-2xl border border-border/70 bg-card p-4 shadow-soft">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="flex items-center gap-1.5 text-sm font-semibold">
+            <Tag className="h-4 w-4 text-film" /> 标签
+            <span className="text-xs font-normal tabular-nums text-muted-foreground">
+              {rowTags.length}
+            </span>
+          </h2>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 rounded-full text-xs"
+            onClick={() => setTagPickerOpen(true)}
+          >
+            <Plus className="h-3.5 w-3.5" /> 添加标签
+          </Button>
+        </div>
+        {rowTags.length === 0 ? (
+          <p className="mt-3 text-sm text-muted-foreground">
+            还没有标签。加几个标签后，首页可以用标签筛选，搜索框也能搜到它。
+          </p>
+        ) : (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {rowTags.map((t) => (
+              <RemovableTagPill
+                key={t.id}
+                name={t.name}
+                onRemove={() => void removeTag(t.id)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* 元信息 */}
       <dl className="grid grid-cols-2 gap-3 rounded-2xl border border-border/70 bg-card p-4 shadow-soft sm:grid-cols-4">
         <Meta icon={<Tag className="h-4 w-4" />} label="分类" value={categoryName} />
@@ -220,10 +308,26 @@ function VideoDetailPage() {
         <Meta icon={<CalendarDays className="h-4 w-4" />} label="上传于" value={formatDate(row.created_at)} />
       </dl>
 
+      <TagPickerDialog
+        open={tagPickerOpen}
+        onOpenChange={setTagPickerOpen}
+        tags={library.tags}
+        mode="add"
+        title="给这个视频加标签"
+        onEnsureTag={library.ensureTag}
+        onConfirm={async (ids) => {
+          await library.addTagToVideos([row.id], ids);
+          setRow((prev) =>
+            prev ? { ...prev, tag_ids: [...new Set([...(prev.tag_ids ?? []), ...ids])] } : prev,
+          );
+          toast.success(`已添加 ${ids.length} 个标签`);
+        }}
+      />
+
       <VideoEditDialog
         open={editOpen}
         onOpenChange={setEditOpen}
-        video={{ ...row, categoryName }}
+        video={{ ...row, categoryName, tags: rowTags }}
         categories={library.categories}
         onSave={saveEdit}
       />

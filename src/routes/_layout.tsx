@@ -36,7 +36,9 @@ function LayoutComponent() {
           open={uploadOpen}
           onOpenChange={setUploadOpen}
           categories={library.categories}
+          tags={library.tags}
           onEnsureCategory={library.ensureCategory}
+          onEnsureTag={library.ensureTag}
           onFinished={library.reload}
         />
         <Toaster position="top-center" richColors closeButton />

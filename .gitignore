@@ -40,3 +40,7 @@ Desktop.ini
 
 # pnpm
 .pnpm-store/
+
+# local backup files
+*.bak
+*.bak-*

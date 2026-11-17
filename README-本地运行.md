@@ -10,6 +10,8 @@
 
 现在运行时**不需要任何云端账号、密钥或网络**，断网也能跑。
 
+> **换机器、重装系统、交给 AI 部署**：先看同目录的 `DEPLOY.md`（系统依赖 ffmpeg、数据在哪、扩盘、自启、自检清单、已知坑）。这份文件记的是「每次改了什么、为什么」，那份记的是「怎么从零跑起来」。
+
 ## 启动
 
 ```powershell
@@ -299,3 +301,231 @@ pnpm typecheck
 pnpm build
 pnpm check:drop
 ```
+
+## 首页只有分类一条 + 「分类与标签」页（2026-11-17）
+
+首页筛选条之前会「挤成两行」：分类胶囊没有 `shrink-0`，分类一多就被压窄、文字换行，看着很乱。现在：
+
+- 分类胶囊条**永远单行**：每个 chip 都 `shrink-0 whitespace-nowrap`，容器 `flex-nowrap + overflow-x-auto`，
+  分类再多也只是横向滚动。
+- 首页只有这一条筛选线，**没有标签条**（标签不再和分类并排抢位置，见下一节）。
+- 独立页面 **`/categories`（分类与标签）**，顶栏入口「分类·标签」（手机上只显示图标）：
+  上半「分类」新建 / 重命名（Enter 保存 / Esc 取消）/ 删除（二次确认，视频归入未分类），
+  每行显示视频数，内置「未分类」不可删；下半「标签」新建 / 重命名 / 删除，点标签名直接回首页按它筛。
+- 手机上编辑 / 删除按钮常显，桌面端 hover 才出现；两块上下单列，不并排挤压。
+- **分类条末尾固定一个「+ 分类」按钮**（在滚动区外，不会被横向滚动带走）：点开就是一个就地小面板 —
+  顶部输入框新建分类，下面每行是现有分类（视频数 + 垃圾桶），点名字直接按它筛，点垃圾桶删除（二次确认，
+  提示视频归入未分类）。下方空间不够时面板自动向上展开。重命名仍去 `/categories`（面板底部有链接）。
+
+改动文件：`src/components/FilterBar.tsx`、`CategoryChipMenu.tsx`（新增）、`TopBar.tsx`、`CategoryManager.tsx`、
+`TagManagerPanel.tsx`（新增）、`src/hooks/useVideoLibrary.ts`（`addCategory` / `removeCategory`）、
+`src/routes/_layout.categories.tsx`、`src/routes/_layout.index.tsx`、`src/types/index.ts`、`src/routeTree.gen.ts`（自动生成）。
+
+新增路由必须先 build（vite 插件重新生成 `routeTree.gen.ts`）再 typecheck，否则报 `不在 FileRoutesByPath`。
+
+## 分类与标签的分工（2026-11-17）
+
+沿用一个判断：**标签是大范围（动漫 / 电影 / 音乐…），分类是细粒度的归类**。所以两者不是重复的两套体系，而是两个层级：
+
+| | 在哪操作 | 在哪看 |
+| --- | --- | --- |
+| 分类 | 首页胶囊条只筛选；新建 / 改名 / 删在 `/categories` | 卡片标题下的分类徽章、详情页「分类」块 |
+| 标签 | 批量加 / 减：首页多选条、上传弹窗；管理在 `/categories` 下半部 | 详情页「标签」块、上传队列条目；**卡片上不显示** |
+
+- **卡片不显示标签**：之前标题下多一行标签会把卡片容器拉长、整页显得松散，现在卡片回到「封面 + 标题 + 分类/大小/日期」。
+- **首页不显示标签条**：想按标签筛，去 `/categories` 点标签名 → 跳 `/?tag=<id>`，首页工具行显示一条
+  「标签：#闪闪 ×」提示（`FilterBar` 的 `activeTag`），点 × 或改地址即清掉。搜索框仍然命中标签名。
+
+## 批量设分类（2026-11-17）
+
+分类是单选，所以批量的语义是「整批改成这个分类」：
+
+- 首页点「多选」→ 勾选若干卡片（长按 / 右键也能进多选）→ 底部批量条的「分类：xxx」按钮展开分类胶囊，
+  点一个立刻生效（`POST /api/videos/bulk-category`，`{video_ids, category_id}`，`category_id: null` = 未分类）。
+- 上传弹窗里勾选队列条目后，用「批量设分类」下拉一次性改这些条目待入库的分类。
+- 选中项分类不一致时按钮显示「设为分类」，一致时显示当前分类名。
+
+```js
+POST /api/videos/bulk-category
+{ "video_ids": ["..."], "category_id": "..." }   // category_id 传 null 即未分类
+→ { ok: true, updated: 2 }
+```
+
+## 标签外观统一（TagPill，2026-11-17）
+
+标签只在少数几个地方出现，为了不让人以为是几套东西，外观只由 `src/components/TagPill.tsx` 定义：
+
+| 变体 | 用在哪 | 样子 |
+| --- | --- | --- |
+| `TagPill` | 上传队列条目 | 淡蓝底 + 蓝字 `#名字` |
+| `TagPillButton` | 加 / 移除标签弹窗 | 同上；可点，选中后填成实心蓝 |
+| `RemovableTagPill` | 详情页标签区 | 同上，右侧带 × 可单独移除 |
+
+三者共用 `tagPillClass()`：`border-film/25 bg-film/10 text-film`，选中态 `border-film bg-film text-primary-foreground`；
+尺寸只有 `sm`（11px）和 `md`（12px）两档。
+
+## 标签（批量打标签，2026-11-17）
+
+分类是「一个视频一个分类」，标签是「一个视频多个标签」，两者互不冲突，可以同时存在。
+
+### 数据表
+
+```sql
+tags        (id, name, name_key UNIQUE, created_at)
+video_tags  (video_id, tag_id, created_at, PK(video_id, tag_id))  -- 两个 FK 都是 ON DELETE CASCADE
+```
+
+- `name` 保留你输入的原样；`name_key` 是去重键：`NFKC`（全角→半角）→ 折叠空白 → `trim` → 小写。
+  所以「ＶＩＰ」「vip」「 VIP 」进库时都指向同一个标签，只留一条；展示名用第一次创建的那个。
+- 标签名最长 30 字，空名直接拒绝。
+- 删标签只删 `video_tags` 里的关联行，视频和文件都不动；删视频则连带清掉它的关联行。
+
+### 接口
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/api/tags` | 全部标签 + `video_count` |
+| POST | `/api/tags` | `{name}` 新建；同名（归一化后）直接返回已有那条，不报错 |
+| PATCH | `/api/tags/:id` | `{name}` 改名；撞名返回 400 |
+| DELETE | `/api/tags/:id` | 删标签（只解绑） |
+| PUT | `/api/videos/:id/tags` | `{tag_ids}` 直接设置某视频的标签集合 |
+| POST | `/api/tags/bulk` | `{video_ids, tag_ids, mode:"add"\|"remove"}` 批量加/减 |
+
+`GET /api/videos` 每条记录多一个 `tag_ids`（全部关联一次查出，没有 N+1）。
+
+### 界面上的入口
+
+- **上传弹窗**：队列里每条左侧有勾选圈（已入库的不再参与），上方有「全选 / 已选 N / 批量设分类 / 给选中项打标签」。
+  标签先存在队列条目的 `MetaData.tagIdsCsv` 里，`associate` 写完记录后紧跟一次 `setVideoTags`，
+  所以「上传完才入库」的那条也能带着标签进来。传输中也能勾选和打标签（associate 读的是最新编辑值）。
+- **首页多选**：工具行的「多选」开关进入勾选模式；卡片长按（触屏 450ms）或右键也能直接进多选。
+  选中后底部出现批量条：设置分类 / 加标签 / 移除标签 / 全选本页 / 取消选择。多选模式下点卡片是勾选，不再跳详情。
+- **详情页**：标签区展示全部胶囊，每个带 × 可单独移除，右上「添加标签」打开选择弹窗。
+- **按标签筛**：首页没有标签条（见上一节），入口在 `/categories` 下半部点标签名 → `/?tag=<id>`。
+- **搜索框**：除了标题，也匹配标签名（`v.title` 或任一 `v.tags.some(t => t.name)` 命中）。
+- **管理标签**：`/categories` 下半部「标签」区，可新建 / 改名 / 删除，删除前有二次确认并提示「视频不受影响」。
+
+### 验收命令
+
+```bash
+pnpm typecheck
+pnpm build
+pnpm api   # 另开一个窗口，直接验证接口
+curl -s http://127.0.0.1:8787/api/tags
+curl -s -X POST http://127.0.0.1:8787/api/tags -H 'Content-Type: application/json' -d '{"name":"翻唱"}'
+```
+
+浏览器侧：刷新页面（`hmr` 已关，必须手动刷新）→ 首页多选两条 → 设置分类 / 加标签 →
+`/categories` 点标签名回首页能按它过滤 → 搜索框输入标签名能命中 → 详情页可单独增删。
+
+## 没封面 + 播放不了：同一个原因（2026-11-17）
+
+现象：个别卡片是灰底胶片图标、时长 `--:--`；点进详情页播放器全黑，提示「此浏览器无法在线播放该编码格式」。
+
+原因是**视频轨编码**，两件事同源：
+
+1. 封面和时长不是服务端生成的，是上传时**浏览器**做的：`src/lib/site.ts` 的 `probeVideo(file)` 把文件挂到
+   `<video>`，`loadeddata` 之后 seek 到约 1.5s，`seeked` 时 `drawImage` 到 canvas 导出 640 宽 JPEG。
+   编码解不了 → 触发 `error` → `duration: null, coverBlob: null`，于是既没封面也没时长。
+2. Chromium 系（Chrome / Edge）不带 H.265 软解，只有装了系统 HEVC 扩展的机器才可能硬解。
+   所以 HEVC(H.265，MP4 box 名 `hvc1` / `hev1`) 的文件，浏览器既抽不了帧也放不了。
+
+判别（不用装任何工具就能看）：
+
+```bash
+# 看视频轨的四字符 box 名：avc1=H.264 能播，hvc1/hev1=HEVC 放不了
+python3 - <<'EOF'
+import sys
+for p in sys.argv[1:]:
+    with open(p,'rb') as f: head=f.read(3_000_000)
+    print(p.split('/')[-1][:40], 'HEVC' if (b'hvc1' in head or b'hev1' in head) else 'H.264' if b'avc1' in head else '?')
+EOF
+```
+
+本次实测：73 条里 9 条是 `hvc1`，其余是 `avc1`。
+
+### 补封面 / 补时长（一次性脚本，已跑过）
+
+```bash
+sudo apt-get install -y ffmpeg          # 服务端第一次需要（本次装的 4.4.2）
+node scripts/backfill-covers.mjs         # dry-run：只探测，不写
+node scripts/backfill-covers.mjs --apply # 抽帧写 <原文件>.cover.jpg，并写回 duration_seconds / cover_path
+```
+
+- 直接打开 `.data/library.db`（`node:sqlite`，带 `busy_timeout`），只改 `cover_path`、`duration_seconds` 两个字段，
+  **不动视频文件**，也不改对象存储布局；封面就和原来一样落在 `<storage_path>.cover.jpg`。
+- 只处理 `cover_path` 或 `duration_seconds` 为空的记录，跑一次就够，不进启动流程、不做定时任务。
+
+### 还差的一步：在线播放
+
+补封面只让卡片好看，**播放仍然是黑的**，因为浏览器就是解不了 HEVC。要能在网页/手机上直接看，
+得把视频轨转成 H.264(AAC)，这也顺带让封面能自动生成：
+
+```bash
+ffmpeg -i in.mp4 -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+       -c:a aac -b:a 128k -movflags +faststart out.mp4
+```
+
+替换对象文件并改 DB 的 `storage_path / size_bytes / mime_type / duration_seconds / cover_path` 属有副作用改动，
+未做；要做建议保留原文件，确认能播再删。
+
+## 网页版转码（自动，2026-11-17）
+
+上面那步只补了封面，**播放仍然黑屏**。现在服务端会给浏览器放不了的编码自动转一份 H.264 的「网页版」：
+
+### 判定与队列
+
+- 入库时（`POST /api/videos`）后台 `ffprobe` 读视频轨 `codec_name`，不阻塞创建接口；
+- `h264 / vp9 / av01 / theora / mpeg4` → 浏览器能解，**什么都不做**（`proxy_status = null`）；
+- 其它（`hevc` 等）→ 排队转码，`proxy_status` 依次 `pending → processing → ready`，失败置 `failed`；
+- 队列**串行**跑（同时只一个 ffmpeg），避免几路转码把 CPU 吃满；
+- 产物是**新文件** `<storage_path>.web.mp4`（和封面同目录同规则），**原片一个字节都不动**；
+- 已经存在 `.web.mp4` 的直接标 `ready`，不重复转。
+
+转码参数：`libx264 -preset veryfast -crf 26 -pix_fmt yuv420p` + `aac 128k` + `+faststart`；
+源高度超过 1080 先缩到 1080（4K 源不会原尺寸转，省空间也省 CPU）。
+
+### 数据字段
+
+```sql
+videos.proxy_path    -- 网页版对象 key，如 uploads/xxx.mp4.web.mp4；NULL = 没有
+videos.proxy_status  -- NULL（不需要） / pending / processing / ready / failed
+```
+
+启动时自动补列（`PRAGMA table_info` 判断后 `ALTER TABLE`），老库直接兼容。
+
+### 接口
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/api/videos`、`/api/videos/:id` | 每条多 `proxy_path` / `proxy_status` |
+| POST | `/api/videos/:id/web-version` | 手动把某条排进队列，返回 202 |
+| POST | `/api/videos/web-version-all` | 存量扫描：逐条探测，只给放不了的编码排队，返回 202 立即返回 |
+
+### 前端行为（`src/routes/_layout.videos.$id.tsx`）
+
+- 播放器 `src = publicUrl(proxy_path || storage_path)`：有网页版播网页版，没有播原片；
+- `proxy_status` 是 `pending/processing` 时，播放器下方显示「正在生成网页版」，并每 5 秒重新拉一次记录（最多 24 次），
+  转完自动切换成可播的那份，不用手动刷新；
+- 失败时提示改用下载；
+- **「下载」按钮永远给原片**（`publicUrl(storage_path)`），画质不受影响。
+
+### 验收
+
+```bash
+# 1. 存量补转（会在后台逐条探测，只排 HEVC 那几条）
+curl -s -X POST http://127.0.0.1:3015/api/videos/web-version-all
+
+# 2. 看进度（status 数一下就够）
+curl -s http://127.0.0.1:3015/api/videos | grep -o '"proxy_status":"[^"]*"' | sort | uniq -c
+
+# 3. 产物与体积
+ls -lh ~/kada/.data/objects/video-library/uploads/*.web.mp4
+```
+
+实测（i9 机器，软件编码）：一条 192 秒的 1080p HEVC（16MB）转完约 80 秒、产物 26MB；9 条约 10 分钟。
+注意 4K HEVC 转 1080p 会久一些，队列是串行的，可以先传着不用等。
+
+体积规律要知道：H.264 比 HEVC 低效，**同一分辨率、同画质下网页版一般比原片大**。本次 9 条原片合计 190MB，
+网页版（CRF 24）354MB。所以网页版只是「能在线播」的副本，原片才是存档；数量上去了要留空间，
+或者把 `-crf` 调到 28、或在 `-vf` 后面加 `-maxrate 3M -bufsize 6M` 把码率封顶。

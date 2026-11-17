@@ -2,25 +2,47 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
+  bulkSetCategory,
+  bulkTagVideos,
   createCategory,
+  createTag,
+  deleteCategory,
   deleteVideo,
   fetchCategories,
+  fetchTags,
   fetchVideos,
   publicUrl,
+  setVideoTags,
   type CategoryRow,
   type SortKey,
+  type TagRow,
   type VideoRow,
   type VideoView,
 } from "@/lib/site";
 
 export interface VideoLibrary {
   categories: CategoryRow[];
+  tags: TagRow[];
   videos: VideoView[];
   loading: boolean;
   error: string | null;
   reload: () => void;
   /** 新建分类（已存在则直接返回），供文件夹自动建类使用 */
   ensureCategory: (name: string) => Promise<CategoryRow>;
+  /** 首页分类条「+」新建分类（同名抛错） */
+  addCategory: (name: string) => Promise<CategoryRow>;
+  /** 首页分类条「+」删除分类（视频归入未分类，随后重新拉数据） */
+  removeCategory: (id: string) => Promise<void>;
+  /** 新建标签（同名复用），返回标签本身 */
+  ensureTag: (name: string) => Promise<TagRow>;
+  /** 批量给视频加标签（首页多选 / 详情页） */
+  addTagToVideos: (videoIds: string[], tagIds: string[]) => Promise<void>;
+  /** 批量移除标签 */
+  removeTagFromVideos: (videoIds: string[], tagIds: string[]) => Promise<void>;
+  /** 详情页：整体替换某个视频的标签 */
+  setVideoTagIds: (videoId: string, tagIds: string[]) => Promise<void>;
+  /** 批量把选中视频改成同一个分类（null = 未分类） */
+  setCategoryForVideos: (videoIds: string[], categoryId: string | null) => Promise<void>;
   refreshCategories: () => Promise<void>;
   setCategoriesLocal: (next: CategoryRow[]) => void;
   download: (video: VideoView) => void;
@@ -30,6 +52,7 @@ export interface VideoLibrary {
 
 export function useVideoLibrary(): VideoLibrary {
   const [categories, setCategories] = useState<CategoryRow[]>([]);
+  const [tags, setTags] = useState<TagRow[]>([]);
   const [rows, setRows] = useState<VideoRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -46,9 +69,10 @@ export function useVideoLibrary(): VideoLibrary {
     setLoading(true);
     setError(null);
     try {
-      const [cats, vids] = await Promise.all([fetchCategories(), fetchVideos()]);
+      const [cats, vids, tagRows] = await Promise.all([fetchCategories(), fetchVideos(), fetchTags()]);
       if (!mounted.current) return;
       setCategories(cats);
+      setTags(tagRows);
       setRows(vids);
     } catch (e) {
       if (!mounted.current) return;
@@ -68,13 +92,22 @@ export function useVideoLibrary(): VideoLibrary {
     return m;
   }, [categories]);
 
+  const tagMap = useMemo(() => {
+    const m = new Map<string, TagRow>();
+    for (const t of tags) m.set(t.id, t);
+    return m;
+  }, [tags]);
+
   const videos = useMemo<VideoView[]>(
     () =>
       rows.map((r) => ({
         ...r,
         categoryName: (r.category_id && categoryMap.get(r.category_id)) || "未分类",
+        tags: (r.tag_ids ?? [])
+          .map((id) => tagMap.get(id))
+          .filter((t): t is TagRow => Boolean(t)),
       })),
-    [rows, categoryMap],
+    [rows, categoryMap, tagMap],
   );
 
   const ensureCategory = useCallback(
@@ -94,6 +127,104 @@ export function useVideoLibrary(): VideoLibrary {
     },
     [categories],
   );
+
+  const ensureTag = useCallback(
+    async (rawName: string): Promise<TagRow> => {
+      const name = rawName.replace(/\s+/g, " ").trim().slice(0, 30);
+      if (!name) throw new Error("标签名不能为空");
+      const key = name.normalize("NFKC").toLowerCase();
+      const existing = tags.find((t) => t.name.normalize("NFKC").toLowerCase() === key);
+      if (existing) return existing;
+      const created = await createTag(name);
+      if (mounted.current)
+        setTags((prev) => (prev.some((t) => t.id === created.id) ? prev : [...prev, created]));
+      return created;
+    },
+    [tags],
+  );
+
+  const addTagToVideos = useCallback(async (videoIds: string[], tagIds: string[]) => {
+    if (videoIds.length === 0 || tagIds.length === 0) return;
+    await bulkTagVideos(videoIds, tagIds, "add");
+    if (!mounted.current) return;
+    // 本地先合并，避免等 reload 才有反馈
+    setRows((prev) =>
+      prev.map((r) =>
+        videoIds.includes(r.id)
+          ? { ...r, tag_ids: [...new Set([...(r.tag_ids ?? []), ...tagIds])] }
+          : r,
+      ),
+    );
+    setTags((prev) =>
+      prev.map((t) =>
+        tagIds.includes(t.id)
+          ? { ...t, video_count: t.video_count + videoIds.length }
+          : t,
+      ),
+    );
+  }, []);
+
+  const removeTagFromVideos = useCallback(async (videoIds: string[], tagIds: string[]) => {
+    if (videoIds.length === 0 || tagIds.length === 0) return;
+    await bulkTagVideos(videoIds, tagIds, "remove");
+    if (!mounted.current) return;
+    setRows((prev) =>
+      prev.map((r) =>
+        videoIds.includes(r.id)
+          ? { ...r, tag_ids: (r.tag_ids ?? []).filter((id) => !tagIds.includes(id)) }
+          : r,
+      ),
+    );
+    setTags((prev) =>
+      prev.map((t) =>
+        tagIds.includes(t.id)
+          ? { ...t, video_count: Math.max(0, t.video_count - videoIds.length) }
+          : t,
+      ),
+    );
+  }, []);
+
+  const setVideoTagIds = useCallback(async (videoId: string, tagIds: string[]) => {
+    await setVideoTags(videoId, tagIds);
+    if (!mounted.current) return;
+    setRows((prev) => prev.map((r) => (r.id === videoId ? { ...r, tag_ids: tagIds } : r)));
+  }, []);
+
+  const setCategoryForVideos = useCallback(
+    async (videoIds: string[], categoryId: string | null) => {
+      if (videoIds.length === 0) return;
+      await bulkSetCategory(videoIds, categoryId);
+      if (!mounted.current) return;
+      setRows((prev) =>
+        prev.map((r) => (videoIds.includes(r.id) ? { ...r, category_id: categoryId } : r)),
+      );
+    },
+    [],
+  );
+
+  const addCategory = useCallback(
+    async (rawName: string) => {
+      const name = rawName.replace(/\s+/g, " ").trim().slice(0, 30);
+      if (!name) throw new Error("分类名不能为空");
+      if (categories.some((c) => c.name.toLowerCase() === name.toLowerCase()))
+        throw new Error(`分类「${name}」已存在`);
+      const created = await createCategory(name);
+      if (mounted.current)
+        setCategories((prev) =>
+          prev.some((c) => c.id === created.id) ? prev : [...prev, created],
+        );
+      return created;
+    },
+    [categories],
+  );
+
+  const removeCategory = useCallback(async (id: string) => {
+    await deleteCategory(id);
+    if (!mounted.current) return;
+    setCategories((prev) => prev.filter((c) => c.id !== id));
+    // 被删分类下的视频已归入「未分类」，重新拉一遍让卡片上的分类徽章跟着变
+    void load();
+  }, []);
 
   const download = useCallback((video: VideoView) => {
     try {
@@ -126,11 +257,19 @@ export function useVideoLibrary(): VideoLibrary {
 
   return {
     categories,
+    tags,
     videos,
     loading,
     error,
     reload: () => void load(),
     ensureCategory,
+    addCategory,
+    removeCategory,
+    ensureTag,
+    addTagToVideos,
+    removeTagFromVideos,
+    setVideoTagIds,
+    setCategoryForVideos,
     refreshCategories: async () => {
       try {
         const cats = await fetchCategories();
@@ -146,12 +285,13 @@ export function useVideoLibrary(): VideoLibrary {
   };
 }
 
-/* ── 首页派生视图：搜索防抖 + 分类筛选 + 排序 ───────────── */
+/* ── 首页派生视图：搜索防抖 + 分类/标签筛选 + 排序 ─────── */
 
 export function useFilteredVideos(
   videos: VideoView[],
   search: string,
   activeCategoryId: string | "all",
+  activeTagId: string | "all",
   sort: SortKey,
 ): { visible: VideoView[]; keyword: string } {
   const [debounced, setDebounced] = useState(search);
@@ -166,15 +306,23 @@ export function useFilteredVideos(
     if (activeCategoryId !== "all") {
       list = list.filter((v) => v.category_id === activeCategoryId);
     }
+    if (activeTagId !== "all") {
+      list = list.filter((v) => (v.tag_ids ?? []).includes(activeTagId));
+    }
     if (kw) {
-      list = list.filter((v) => v.title.toLowerCase().includes(kw));
+      // 标题命中，或任一标签名命中
+      list = list.filter(
+        (v) =>
+          v.title.toLowerCase().includes(kw) ||
+          v.tags.some((t) => t.name.toLowerCase().includes(kw)),
+      );
     }
     const sorted = [...list];
     if (sort === "newest") sorted.sort((a, b) => b.created_at.localeCompare(a.created_at));
     else if (sort === "oldest") sorted.sort((a, b) => a.created_at.localeCompare(b.created_at));
     else sorted.sort((a, b) => a.title.localeCompare(b.title, "zh-CN"));
     return sorted;
-  }, [videos, debounced, activeCategoryId, sort]);
+  }, [videos, debounced, activeCategoryId, activeTagId, sort]);
 
   return { visible, keyword: debounced };
 }

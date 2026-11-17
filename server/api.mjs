@@ -10,6 +10,7 @@ import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -48,7 +49,33 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS videos_category_idx ON videos (category_id);
   CREATE INDEX IF NOT EXISTS videos_created_idx ON videos (created_at DESC);
+
+  -- 标签：name 是展示用（保留用户输入的全角/大小写），name_key 是去重键（NFKC + 小写 + trim）
+  CREATE TABLE IF NOT EXISTS tags (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+  );
+
+  -- 一个视频可以有多个标签，与 category_id 互不冲突
+  CREATE TABLE IF NOT EXISTS video_tags (
+    video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (video_id, tag_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS video_tags_tag_idx ON video_tags (tag_id);
 `);
+
+// 网页版（浏览器友好版）：HEVC 等浏览器解不了的编码，服务端转一份 H.264 供在线播放。
+// proxy_path 为空表示没有网页版；proxy_status 记录队列状态（pending / processing / ready / failed）。
+{
+  const cols = db.prepare("PRAGMA table_info(videos)").all().map((c) => c.name);
+  if (!cols.includes("proxy_path")) db.exec("ALTER TABLE videos ADD COLUMN proxy_path TEXT");
+  if (!cols.includes("proxy_status")) db.exec("ALTER TABLE videos ADD COLUMN proxy_status TEXT");
+}
 
 // 兜底分类：与原先「未分类」默认分类对齐。
 const seedName = "未分类";
@@ -60,7 +87,7 @@ if (!existingDefault) {
 }
 
 const VIDEO_COLS =
-  "id, title, original_name, category_id, storage_path, mime_type, size_bytes, duration_seconds, cover_path, folder_hint, created_at";
+  "id, title, original_name, category_id, storage_path, mime_type, size_bytes, duration_seconds, cover_path, folder_hint, created_at, proxy_path, proxy_status";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -109,7 +136,7 @@ function asCategory(row) {
   };
 }
 
-function asVideo(row) {
+function asVideo(row, tagIds) {
   return {
     id: row.id,
     title: row.title,
@@ -122,8 +149,140 @@ function asVideo(row) {
     cover_path: row.cover_path,
     folder_hint: row.folder_hint,
     created_at: row.created_at,
+    proxy_path: row.proxy_path ?? null,
+    proxy_status: row.proxy_status ?? null,
+    tag_ids: tagIds ?? tagIdsOf(row.id),
   };
 }
+
+/* ── 标签 ─────────────────────────────────────────────────── */
+
+/** 去重键：全角/半角、大小写、首尾空白都归一到同一个 key，展示名仍保留原样。 */
+function tagKeyOf(name) {
+  return String(name ?? "")
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function asTag(row, count) {
+  return {
+    id: row.id,
+    name: row.name,
+    created_at: row.created_at,
+    video_count: Number(count ?? 0),
+  };
+}
+
+const tagCounts = () => {
+  const map = new Map();
+  for (const row of db.prepare("SELECT tag_id, COUNT(*) AS n FROM video_tags GROUP BY tag_id").all()) {
+    map.set(row.tag_id, Number(row.n));
+  }
+  return map;
+};
+
+function listTags() {
+  const counts = tagCounts();
+  return db
+    .prepare("SELECT id, name, created_at FROM tags ORDER BY name ASC")
+    .all()
+    .map((row) => asTag(row, counts.get(row.id) ?? 0));
+}
+
+/** 建标签：同名（归一化后）直接复用，不报错也不产生第二条。 */
+function ensureTag(rawName) {
+  const name = String(rawName ?? "").replace(/\s+/g, " ").trim().slice(0, 30);
+  if (!name) throw new Error("标签名不能为空。");
+  const key = tagKeyOf(name);
+  const existing = db.prepare("SELECT id, name, created_at FROM tags WHERE name_key = ?").get(key);
+  if (existing) return asTag(existing, tagCounts().get(existing.id) ?? 0);
+  const row = { id: randomUUID(), name, name_key: key, created_at: new Date().toISOString() };
+  try {
+    db.prepare("INSERT INTO tags (id, name, name_key, created_at) VALUES (?, ?, ?, ?)").run(
+      row.id, row.name, row.name_key, row.created_at,
+    );
+  } catch (cause) {
+    // 并发下唯一键可能被抢先写入，回读即可
+    if (String(cause.message).includes("UNIQUE")) {
+      const again = db.prepare("SELECT id, name, created_at FROM tags WHERE name_key = ?").get(key);
+      if (again) return asTag(again, 0);
+    }
+    throw cause;
+  }
+  return asTag(row, 0);
+}
+
+function renameTag(id, rawName) {
+  const existing = db.prepare("SELECT id, name, name_key, created_at FROM tags WHERE id = ?").get(id);
+  if (!existing) return null;
+  const name = String(rawName ?? "").replace(/\s+/g, " ").trim().slice(0, 30);
+  if (!name) throw new Error("标签名不能为空。");
+  const key = tagKeyOf(name);
+  const clash = db.prepare("SELECT id FROM tags WHERE name_key = ? AND id <> ?").get(key, id);
+  if (clash) throw new Error(`标签「${name}」已存在`);
+  db.prepare("UPDATE tags SET name = ?, name_key = ? WHERE id = ?").run(name, key, id);
+  return asTag({ ...existing, name }, tagCounts().get(id) ?? 0);
+}
+
+function deleteTag(id) {
+  if (!db.prepare("SELECT id FROM tags WHERE id = ?").get(id)) return false;
+  // 关联行随 ON DELETE CASCADE 一起清掉；视频本身不动
+  db.prepare("DELETE FROM tags WHERE id = ?").run(id);
+  return true;
+}
+
+function tagIdsOf(videoId) {
+  return db
+    .prepare("SELECT tag_id FROM video_tags WHERE video_id = ?")
+    .all(videoId)
+    .map((row) => row.tag_id);
+}
+
+/** 给一个视频设置标签集合：传入的 id 必须已存在；重复的忽略。 */
+function setVideoTags(videoId, tagIds) {
+  if (!db.prepare("SELECT id FROM videos WHERE id = ?").get(videoId)) return null;
+  if (!Array.isArray(tagIds)) throw new Error("tag_ids 必须是数组。");
+  const ids = [...new Set(tagIds.map((value) => String(value)))];
+  for (const tagId of ids) {
+    if (!db.prepare("SELECT id FROM tags WHERE id = ?").get(tagId)) throw new Error("标签不存在。");
+  }
+  db.prepare("DELETE FROM video_tags WHERE video_id = ?").run(videoId);
+  const now = new Date().toISOString();
+  const insert = db.prepare("INSERT INTO video_tags (video_id, tag_id, created_at) VALUES (?, ?, ?)");
+  for (const tagId of ids) insert.run(videoId, tagId, now);
+  return getVideo(videoId);
+}
+
+/** 批量加/减标签：一次请求处理多个视频，上传弹窗与首页多选都用它。 */
+function bulkTagVideos(videoIds, tagIds, mode) {
+  if (!Array.isArray(videoIds) || videoIds.length === 0) throw new Error("未指定视频。");
+  const ids = [...new Set(videoIds.map((value) => String(value)))];
+  for (const videoId of ids) {
+    if (!db.prepare("SELECT id FROM videos WHERE id = ?").get(videoId)) throw new Error("视频不存在。");
+  }
+  const tagIdsList = Array.isArray(tagIds) ? [...new Set(tagIds.map((value) => String(value)))] : [];
+  if (mode === "add") {
+    if (tagIdsList.length === 0) throw new Error("未指定标签。");
+    for (const tagId of tagIdsList) {
+      if (!db.prepare("SELECT id FROM tags WHERE id = ?").get(tagId)) throw new Error("标签不存在。");
+    }
+    const now = new Date().toISOString();
+    const insert = db.prepare(
+      "INSERT OR IGNORE INTO video_tags (video_id, tag_id, created_at) VALUES (?, ?, ?)",
+    );
+    for (const videoId of ids) for (const tagId of tagIdsList) insert.run(videoId, tagId, now);
+  } else if (mode === "remove") {
+    if (tagIdsList.length === 0) throw new Error("未指定标签。");
+    const remove = db.prepare("DELETE FROM video_tags WHERE video_id = ? AND tag_id = ?");
+    for (const videoId of ids) for (const tagId of tagIdsList) remove.run(videoId, tagId);
+  } else {
+    throw new Error("mode 只能是 add 或 remove。");
+  }
+  return { ok: true, video_ids: ids, tag_ids: tagIdsList, mode };
+}
+
 
 const categoryExists = (name, exceptId) => {
   const row = exceptId
@@ -188,11 +347,34 @@ function deleteCategory(id) {
   return true;
 }
 
+/** 批量把一批视频改成同一个分类（null = 未分类）。分类是单选，语义就是「整批改成」。 */
+function bulkSetCategory(videoIds, categoryId) {
+  const ids = Array.isArray(videoIds) ? videoIds.map((v) => String(v)) : [];
+  if (ids.length === 0) throw new Error("没有选中任何视频。");
+  if (categoryId !== null && categoryId !== undefined) {
+    if (!db.prepare("SELECT id FROM video_categories WHERE id = ?").get(String(categoryId))) {
+      throw new Error("分类不存在。");
+    }
+  }
+  const target = categoryId === null || categoryId === undefined ? null : String(categoryId);
+  const update = db.prepare("UPDATE videos SET category_id = ? WHERE id = ?");
+  let updated = 0;
+  for (const id of ids) updated += update.run(target, id).changes;
+  return { ok: true, updated };
+}
+
 function listVideos() {
+  // 一次查出全部关联，避免每条视频各查一次标签
+  const byVideo = new Map();
+  for (const row of db.prepare("SELECT video_id, tag_id FROM video_tags").all()) {
+    const list = byVideo.get(row.video_id);
+    if (list) list.push(row.tag_id);
+    else byVideo.set(row.video_id, [row.tag_id]);
+  }
   return db
     .prepare(`SELECT ${VIDEO_COLS} FROM videos ORDER BY created_at DESC LIMIT 1000`)
     .all()
-    .map(asVideo);
+    .map((row) => asVideo(row, byVideo.get(row.id) ?? []));
 }
 
 function getVideo(id) {
@@ -231,11 +413,13 @@ function createVideo(payload) {
     created_at: new Date().toISOString(),
   };
   db.prepare(
-    `INSERT INTO videos (${VIDEO_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO videos (${VIDEO_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     row.id, row.title, row.original_name, row.category_id, row.storage_path, row.mime_type,
     row.size_bytes, row.duration_seconds, row.cover_path, row.folder_hint, row.created_at,
+    null, null,
   );
+  queueTranscodeIfNeeded(row.id);
   return getVideo(row.id);
 }
 
@@ -262,10 +446,255 @@ function patchVideo(id, payload) {
 }
 
 function deleteVideo(id) {
-  const existing = db.prepare("SELECT id FROM videos WHERE id = ?").get(id);
-  if (!existing) return false;
+  const existing = db
+    .prepare("SELECT storage_path, cover_path, proxy_path FROM videos WHERE id = ?")
+    .get(id);
+  if (!existing) return null;
   db.prepare("DELETE FROM videos WHERE id = ?").run(id);
-  return true;
+  return existing;
+}
+
+// 删除记录后顺手清掉对象文件（storage_path 是桶内相对 key，如 uploads/xxx.mp4）
+const OBJECT_ROOT = path.resolve(
+  process.env.OBJECT_STORE_DATA ?? path.join(here, "..", ".data", "objects"),
+);
+
+async function removeStoredObject(key) {
+  const relative = String(key ?? "").trim().replace(/^\/+/, "");
+  if (!relative || relative.includes("..")) return false;
+  let buckets;
+  try {
+    buckets = (await fs.readdir(OBJECT_ROOT, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return false;
+  }
+  let removed = false;
+  for (const bucket of buckets) {
+    const base = path.join(OBJECT_ROOT, bucket);
+    const target = path.join(base, relative);
+    if (!target.startsWith(base + path.sep)) continue;
+    try {
+      await fs.unlink(target);
+      removed = true;
+    } catch {
+      // 文件不存在就跳过，不让删除接口因为孤儿对象失败
+    }
+  }
+  return removed;
+}
+
+/* ── 网页版转码队列（HEVC → H.264）─────────────────────────
+   浏览器（Chrome/Edge/手机）不带 H.265 解码，HEVC 文件只能下载后看。
+   这里在服务端按需转一份 H.264 的 <原文件>.web.mp4，前端优先播它，原片不动。
+   队列串行跑，避免几路 ffmpeg 同时把 CPU 吃满。 */
+
+const FFMPEG = process.env.FFMPEG_PATH ?? "ffmpeg";
+const FFPROBE = process.env.FFPROBE_PATH ?? "ffprobe";
+const BROWSER_OK_CODECS = new Set(["h264", "vp9", "vp09", "av1", "av01", "theora", "mpeg4"]);
+const transcodeQueue = [];
+let transcodeRunning = false;
+
+/** 在对象根的所有桶里找 key 对应的真实文件路径（与 removeStoredObject 同布局，但只读）。 */
+async function locateObjectPath(key) {
+  const relative = String(key ?? "").trim().replace(/^\/+/, "");
+  if (!relative || relative.includes("..")) return null;
+  let buckets;
+  try {
+    buckets = (await fs.readdir(OBJECT_ROOT, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return null;
+  }
+  for (const bucket of buckets) {
+    const base = path.join(OBJECT_ROOT, bucket);
+    const target = path.join(base, relative);
+    if (!target.startsWith(base + path.sep)) continue;
+    try {
+      await fs.access(target);
+      return target;
+    } catch {
+      // 不存在就找下一个桶
+    }
+  }
+  return null;
+}
+
+function spawnCapture(cmd, args) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      err += chunk;
+    });
+    child.on("error", (cause) => resolve({ code: -1, out, err: String(cause?.message ?? cause) }));
+    child.on("close", (code) => resolve({ code, out, err }));
+  });
+}
+
+/** 读视频轨编码与尺寸；读不到返回 null。 */
+async function probeStream(file) {
+  const r = await spawnCapture(FFPROBE, [
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries", "stream=codec_name,width,height,pix_fmt",
+    "-of", "json",
+    file,
+  ]);
+  if (r.code !== 0) return null;
+  try {
+    const data = JSON.parse(r.out);
+    const stream = (data.streams ?? [])[0];
+    if (!stream?.codec_name) return null;
+    return {
+      codec: String(stream.codec_name).toLowerCase(),
+      width: Number(stream.width) || 0,
+      height: Number(stream.height) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function setProxyStatus(id, status, proxyPath) {
+  if (proxyPath === undefined) {
+    db.prepare("UPDATE videos SET proxy_status = ? WHERE id = ?").run(status, id);
+  } else {
+    db.prepare("UPDATE videos SET proxy_status = ?, proxy_path = ? WHERE id = ?").run(status, proxyPath, id);
+  }
+}
+
+/** 转一条：产出 <原文件>.web.mp4，成功才写 proxy_path。失败只改状态，绝不替换原片。 */
+async function transcodeOne(videoId) {
+  const row = db.prepare("SELECT storage_path FROM videos WHERE id = ?").get(videoId);
+  if (!row) return;
+  const file = await locateObjectPath(row.storage_path);
+  if (!file) {
+    setProxyStatus(videoId, "failed");
+    return;
+  }
+  const stream = await probeStream(file);
+  if (!stream) {
+    setProxyStatus(videoId, "failed");
+    return;
+  }
+  // 已经转过的直接标 ready，不重复跑
+  const proxyKey = `${row.storage_path}.web.mp4`;
+  const existing = await locateObjectPath(proxyKey);
+  if (existing) {
+    setProxyStatus(videoId, "ready", proxyKey);
+    return;
+  }
+
+  setProxyStatus(videoId, "processing");
+  const outAbs = `${file}.web.mp4`;
+  const scale = stream.height > 1080
+    ? "scale=-2:1080"
+    : "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+  const started = Date.now();
+  const r = await spawnCapture(FFMPEG, [
+    "-y", "-v", "error",
+    "-i", file,
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
+    "-vf", scale,
+    "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+    "-movflags", "+faststart",
+    outAbs,
+  ]);
+  if (r.code !== 0) {
+    console.error(`[transcode] 失败 ${videoId}: ${String(r.err).slice(-300)}`);
+    await fs.rm(outAbs, { force: true }).catch(() => {});
+    setProxyStatus(videoId, "failed");
+    return;
+  }
+  const stat = await fs.stat(outAbs).catch(() => null);
+  if (!stat || stat.size < 1024) {
+    await fs.rm(outAbs, { force: true }).catch(() => {});
+    setProxyStatus(videoId, "failed");
+    return;
+  }
+  setProxyStatus(videoId, "ready", proxyKey);
+  console.log(
+    `[transcode] 完成 ${videoId}，${Math.round((Date.now() - started) / 1000)}s，${(stat.size / 1048576).toFixed(1)}MB`,
+  );
+}
+
+async function drainTranscodeQueue() {
+  if (transcodeRunning) return;
+  transcodeRunning = true;
+  try {
+    while (transcodeQueue.length > 0) {
+      const id = transcodeQueue.shift();
+      try {
+        await transcodeOne(id);
+      } catch (cause) {
+        console.error("[transcode] 队列异常:", cause?.message ?? cause);
+        setProxyStatus(id, "failed");
+      }
+    }
+  } finally {
+    transcodeRunning = false;
+  }
+}
+
+function enqueueTranscode(videoId) {
+  const id = String(videoId);
+  if (!transcodeQueue.includes(id)) transcodeQueue.push(id);
+  setProxyStatus(id, "pending");
+  void drainTranscodeQueue();
+}
+
+/** 新上传/新入库时判定：能在浏览器播的不动，放不了的自动排队转网页版。 */
+function queueTranscodeIfNeeded(videoId) {
+  // 不阻塞创建接口：探测和转码都在后台做
+  setImmediate(async () => {
+    try {
+      const row = db.prepare("SELECT storage_path FROM videos WHERE id = ?").get(videoId);
+      if (!row) return;
+      const file = await locateObjectPath(row.storage_path);
+      if (!file) return;
+      const stream = await probeStream(file);
+      if (!stream) return;
+      if (BROWSER_OK_CODECS.has(stream.codec)) {
+        setProxyStatus(videoId, null);
+        return;
+      }
+      enqueueTranscode(videoId);
+    } catch (cause) {
+      console.error("[transcode] 入队判定失败:", cause?.message ?? cause);
+    }
+  });
+}
+
+/** 存量补转：逐个探测，只有浏览器放不了的编码才排队；H.264 一律标为「不需要网页版」。 */
+async function enqueueAllNeedingWebVersion() {
+  const rows = db
+    .prepare("SELECT id, storage_path, proxy_status, proxy_path FROM videos")
+    .all();
+  let queued = 0;
+  let skipped = 0;
+  for (const row of rows) {
+    if (row.proxy_path) continue;
+    if (row.proxy_status === "pending" || row.proxy_status === "processing") continue;
+    const file = await locateObjectPath(row.storage_path);
+    if (!file) continue;
+    const stream = await probeStream(file);
+    if (!stream) continue;
+    if (BROWSER_OK_CODECS.has(stream.codec)) {
+      setProxyStatus(row.id, null);
+      skipped++;
+      continue;
+    }
+    enqueueTranscode(row.id);
+    queued++;
+  }
+  return { ok: true, checked: rows.length, queued, already_playable: skipped };
 }
 
 const server = createServer(async (req, res) => {
@@ -313,9 +742,80 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // /api/tags
+    if (segments[1] === "tags") {
+      const id = segments[2];
+      if (req.method === "GET" && !id) {
+        sendJson(res, 200, listTags());
+        return;
+      }
+      if (req.method === "POST" && !id) {
+        const body = await readJsonBody(req);
+        sendJson(res, 201, ensureTag(body.name));
+        return;
+      }
+      // 批量加/减标签：{ video_ids: [], tag_ids: [], mode: "add" | "remove" }
+      if (req.method === "POST" && id === "bulk") {
+        const body = await readJsonBody(req);
+        sendJson(res, 200, bulkTagVideos(body.video_ids, body.tag_ids, body.mode));
+        return;
+      }
+      if (req.method === "PATCH" && id) {
+        const body = await readJsonBody(req);
+        const updated = renameTag(id, body.name);
+        if (!updated) fail(res, 404, "标签不存在。");
+        else sendJson(res, 200, updated);
+        return;
+      }
+      if (req.method === "DELETE" && id) {
+        const removed = deleteTag(id);
+        if (!removed) fail(res, 404, "标签不存在。");
+        else sendJson(res, 200, { ok: true });
+        return;
+      }
+      fail(res, 405, "标签接口不支持该方法");
+      return;
+    }
+
     // /api/videos
     if (segments[1] === "videos") {
       const id = segments[2];
+      // PUT /api/videos/:id/tags —— 直接设置该视频的标签集合
+      if (req.method === "PUT" && id && segments[3] === "tags") {
+        const body = await readJsonBody(req);
+        const updated = setVideoTags(id, body.tag_ids ?? []);
+        if (!updated) fail(res, 404, "视频不存在。");
+        else sendJson(res, 200, updated);
+        return;
+      }
+      // POST /api/videos/bulk-category —— 批量把一批视频设为同一个分类（null = 未分类）
+      if (req.method === "POST" && id === "bulk-category") {
+        const body = await readJsonBody(req);
+        sendJson(res, 200, bulkSetCategory(body.video_ids, body.category_id ?? null));
+        return;
+      }
+      // POST /api/videos/web-version-all —— 存量扫描：给浏览器放不了的编码排队转网页版
+      if (req.method === "POST" && id === "web-version-all") {
+        // 扫描要逐个 ffprobe，放到后台跑，别把接口和其他请求一起堵住
+        setImmediate(() => {
+          enqueueAllNeedingWebVersion().catch((cause) => {
+            console.error("[transcode] 存量扫描失败:", cause?.message ?? cause);
+          });
+        });
+        sendJson(res, 202, { ok: true, started: true });
+        return;
+      }
+      // POST /api/videos/:id/web-version —— 手动触发某条转网页版
+      if (req.method === "POST" && id && segments[3] === "web-version") {
+        const row = getVideo(id);
+        if (!row) {
+          fail(res, 404, "视频不存在。");
+        } else {
+          enqueueTranscode(id);
+          sendJson(res, 202, getVideo(id));
+        }
+        return;
+      }
       if (req.method === "GET" && !id) {
         sendJson(res, 200, listVideos());
         return;
@@ -340,8 +840,14 @@ const server = createServer(async (req, res) => {
       }
       if (req.method === "DELETE" && id) {
         const removed = deleteVideo(id);
-        if (!removed) fail(res, 404, "视频不存在。");
-        else sendJson(res, 200, { ok: true });
+        if (!removed) {
+          fail(res, 404, "视频不存在。");
+        } else {
+          await removeStoredObject(removed.storage_path);
+          if (removed.cover_path) await removeStoredObject(removed.cover_path);
+          if (removed.proxy_path) await removeStoredObject(removed.proxy_path);
+          sendJson(res, 200, { ok: true });
+        }
         return;
       }
       fail(res, 405, "视频接口不支持该方法");

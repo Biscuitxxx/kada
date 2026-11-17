@@ -1,7 +1,8 @@
-// 视频网格容器 + 卡片（紧耦合父子同文件）：封面、时长角标、更多菜单、空态/加载/错误
-import { useState } from "react";
+// 视频网格容器 + 卡片（紧耦合父子同文件）：封面、时长角标、标签、更多菜单、多选、空态/加载/错误
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import {
+  Check,
   Download,
   FilmIcon,
   MoreVertical,
@@ -26,6 +27,9 @@ import type { VideoCardProps, VideoGridProps } from "@/types";
 // 空状态插画随项目落地到 public/，不再依赖秒悟 CDN
 const EMPTY_ART = "/empty-state-art.png";
 
+/** 长按进入多选的判定时长（毫秒） */
+const LONG_PRESS_MS = 450;
+
 export function VideoGrid({
   videos,
   loading,
@@ -37,6 +41,10 @@ export function VideoGrid({
   onUploadClick,
   onDownload,
   onDelete,
+  selecting,
+  selectedIds,
+  onToggleSelect,
+  onLongPress,
 }: VideoGridProps) {
   if (loading) {
     return (
@@ -108,7 +116,16 @@ export function VideoGrid({
     <div className={GRID_CLS[view]}>
       {videos.map((v, i) => (
         <div key={v.id} className="reveal" data-reveal-delay={String(Math.min(i, 7) * 60)}>
-          <VideoCard video={v} view={view} onDownload={onDownload} onDelete={onDelete} />
+          <VideoCard
+            video={v}
+            view={view}
+            onDownload={onDownload}
+            onDelete={onDelete}
+            selecting={selecting}
+            selected={selectedIds.has(v.id)}
+            onToggleSelect={onToggleSelect}
+            onLongPress={onLongPress}
+          />
         </div>
       ))}
     </div>
@@ -122,9 +139,46 @@ const GRID_CLS: Record<VideoGridProps["view"], string> = {
 
 /* ── 卡片（子组件内联） ─────────────────────────────────── */
 
-function VideoCard({ video, view, onDownload, onDelete }: VideoCardProps) {
+function VideoCard({
+  video,
+  view,
+  onDownload,
+  onDelete,
+  selecting,
+  selected,
+  onToggleSelect,
+  onLongPress,
+}: VideoCardProps) {
   const [coverFailed, setCoverFailed] = useState(false);
   const coverSrc = video.cover_path && !coverFailed ? publicUrl(video.cover_path) : null;
+
+  // 长按判定：移动超过 10px 或抬起就取消（避免影响横向滑动和滚动）
+  const timerRef = useRef<number | null>(null);
+  const startRef = useRef<{ x: number; y: number } | null>(null);
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    startRef.current = null;
+  }, []);
+  useEffect(() => clearTimer, [clearTimer]);
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (selecting || e.button !== 0) return;
+    startRef.current = { x: e.clientX, y: e.clientY };
+    clearTimer();
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      startRef.current = null;
+      onLongPress(video);
+    }, LONG_PRESS_MS);
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    const start = startRef.current;
+    if (!start) return;
+    if (Math.abs(e.clientX - start.x) > 10 || Math.abs(e.clientY - start.y) > 10) clearTimer();
+  };
 
   const thumb = (
     <div
@@ -148,17 +202,30 @@ function VideoCard({ video, view, onDownload, onDelete }: VideoCardProps) {
         </div>
       )}
       <span className="duration-badge">{formatDuration(video.duration_seconds)}</span>
-      {view === "grid" && (
+      {view === "grid" && !selecting && (
         <span className="play-float">
           <span>
             <PlayCircle className="h-6 w-6" />
           </span>
         </span>
       )}
+      {(selecting || selected) && (
+        <span
+          className={cn(
+            "absolute left-2 top-2 z-10 grid h-6 w-6 place-items-center rounded-full border-2 backdrop-blur-sm transition-colors",
+            selected
+              ? "border-film bg-film text-primary-foreground"
+              : "border-white/70 bg-black/25 text-transparent",
+          )}
+          aria-hidden
+        >
+          <Check className="h-3.5 w-3.5" />
+        </span>
+      )}
     </div>
   );
 
-  const menu = (
+  const menu = !selecting && (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <button
@@ -200,14 +267,49 @@ function VideoCard({ video, view, onDownload, onDelete }: VideoCardProps) {
     </div>
   );
 
+  const shellCls = cn(
+    "clip-card group relative block cursor-pointer overflow-hidden rounded-2xl border bg-card outline-none transition-shadow",
+    selected ? "border-film ring-2 ring-film/40" : "border-border/60",
+    view === "list" && "flex items-center gap-3 p-2 sm:p-2",
+  );
+
+  if (selecting) {
+    return (
+      <div
+        role="checkbox"
+        aria-checked={selected}
+        aria-label={`选择 ${video.title}`}
+        tabIndex={0}
+        onClick={() => onToggleSelect(video)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onToggleSelect(video);
+          }
+        }}
+        className={shellCls}
+      >
+        {thumb}
+        {meta}
+      </div>
+    );
+  }
+
   return (
     <Link
       to="/videos/$id"
       params={{ id: video.id }}
-      className={cn(
-        "clip-card group relative block overflow-hidden rounded-2xl border border-border/60 bg-card outline-none",
-        view === "list" && "flex items-center gap-3 p-2 sm:p-2",
-      )}
+      className={shellCls}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={clearTimer}
+      onPointerCancel={clearTimer}
+      onPointerLeave={clearTimer}
+      onContextMenu={(e) => {
+        // 移动端长按会被系统当成「长按菜单」，拦下来交给多选
+        e.preventDefault();
+        onLongPress(video);
+      }}
     >
       {thumb}
       {meta}

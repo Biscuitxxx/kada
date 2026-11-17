@@ -26,6 +26,13 @@ export interface CategoryRow {
   is_default: boolean;
 }
 
+export interface TagRow {
+  id: string;
+  name: string;
+  created_at: string;
+  video_count: number;
+}
+
 export interface VideoRow {
   id: string;
   title: string;
@@ -38,10 +45,18 @@ export interface VideoRow {
   cover_path: string | null;
   folder_hint: string | null;
   created_at: string;
+  /** 浏览器友好版（H.264）对象路径；HEVC 等放不了的编码由服务端转出来，为空表示没转/不需要 */
+  proxy_path?: string | null;
+  /** 网页版状态：pending / processing / ready / failed；null 表示原片浏览器就能播 */
+  proxy_status?: "pending" | "processing" | "ready" | "failed" | null;
+  /** 该视频身上的标签 id（标签名从 tags 表映射） */
+  tag_ids: string[];
 }
 
 export interface VideoView extends VideoRow {
   categoryName: string;
+  /** 已解析好的标签（id + 展示名），卡片与详情页直接用 */
+  tags: TagRow[];
 }
 
 export type SortKey = "newest" | "oldest" | "title";
@@ -144,6 +159,60 @@ export async function renameCategory(id: string, name: string): Promise<void> {
 /** 删除分类：后端把该分类下的视频设为未分类（等价原 ON DELETE SET NULL） */
 export async function deleteCategory(id: string): Promise<void> {
   await apiRequest<{ ok: boolean }>(`/categories/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+/* ── 标签 ───────────────────────────────────────────────── */
+
+export async function fetchTags(): Promise<TagRow[]> {
+  return apiRequest<TagRow[]>("/tags");
+}
+
+/** 新建标签：同名（归一化后）后端直接复用已有标签，不报错 */
+export async function createTag(name: string): Promise<TagRow> {
+  return apiRequest<TagRow>("/tags", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function renameTag(id: string, name: string): Promise<TagRow> {
+  return apiRequest<TagRow>(`/tags/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+}
+
+/** 删除标签：只解除它与视频的关联，视频本身保留 */
+export async function deleteTag(id: string): Promise<void> {
+  await apiRequest<{ ok: boolean }>(`/tags/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+/** 直接设置某个视频的标签集合（详情页单条增删用） */
+export async function setVideoTags(videoId: string, tagIds: string[]): Promise<void> {
+  await apiRequest<VideoRow>(`/videos/${encodeURIComponent(videoId)}/tags`, {
+    method: "PUT",
+    body: JSON.stringify({ tag_ids: tagIds }),
+  });
+}
+
+/** 批量加/减标签（上传弹窗统一打标签、首页多选用） */
+export async function bulkTagVideos(
+  videoIds: string[],
+  tagIds: string[],
+  mode: "add" | "remove",
+): Promise<void> {
+  await apiRequest<{ ok: boolean }>("/tags/bulk", {
+    method: "POST",
+    body: JSON.stringify({ video_ids: videoIds, tag_ids: tagIds, mode }),
+  });
+}
+
+/** 批量把一批视频设为同一个分类（null = 未分类）；分类是单选，所以语义是「整批改成」 */
+export async function bulkSetCategory(videoIds: string[], categoryId: string | null): Promise<void> {
+  await apiRequest<{ ok: boolean }>("/videos/bulk-category", {
+    method: "POST",
+    body: JSON.stringify({ video_ids: videoIds, category_id: categoryId }),
+  });
 }
 
 export async function fetchVideos(): Promise<VideoRow[]> {

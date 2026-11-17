@@ -2,11 +2,13 @@
 import { useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
+  Check,
   CheckCircle2,
   FolderUp,
   Loader2,
   RefreshCw,
   ShieldAlert,
+  Tag,
   UploadCloud,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -15,6 +17,8 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Progress } from "@/components/ui/progress";
 import { toast } from "sonner";
+import { TagPickerDialog } from "@/components/TagPickerDialog";
+import { TagPill } from "@/components/TagPill";
 import { collectEntryFiles, readDropEntries } from "@/lib/dropped-files";
 import { createObjectStoreUploadService, useUploadQueue } from "@/features/file-upload";
 import { sanitizeDownloadName } from "@/features/file-upload/filePolicy";
@@ -25,6 +29,7 @@ import {
   insertVideoRecord,
   isVideoFile,
   prepareMediaMeta,
+  setVideoTags,
   titleFromFileName,
 } from "@/lib/site";
 import type { CategoryRow, UploadDialogProps } from "@/types";
@@ -68,7 +73,15 @@ interface MetaData extends Readonly<Record<string, string | number | boolean | n
   title: string;
   categoryId: string | null;
   folderHint: string | null;
+  /** 标签 id，逗号分隔（MetaData 只能放标量，数组放不下） */
+  tagIdsCsv: string;
 }
+
+const parseTagIds = (csv: string | null | undefined): string[] =>
+  (csv ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
 interface EditState {
   file: File;
@@ -82,7 +95,9 @@ export function UploadDialog({
   open,
   onOpenChange,
   categories,
+  tags,
   onEnsureCategory,
+  onEnsureTag,
   onFinished,
 }: UploadDialogProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -91,6 +106,11 @@ export function UploadDialog({
   const [scanning, setScanning] = useState(false);
   /** meta.key -> 原始 File 与可编辑元信息 */
   const [edits, setEdits] = useState<Map<string, EditState>>(new Map());
+  /** 队列里勾选的条目，用于批量打标签 */
+  const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
+  const [tagPickerOpen, setTagPickerOpen] = useState(false);
+  // 批量设分类的 Select 用 key 重置回占位态（Radix 不接受空字符串 value）
+  const [catPickerKey, setCatPickerKey] = useState(0);
   const editsBridge = useRef(edits);
   editsBridge.current = edits;
   /**
@@ -133,7 +153,7 @@ export function UploadDialog({
 
       // 3. 写入业务记录（精确回执）
       flowScope.assertCurrent();
-      await insertVideoRecord({
+      const row = await insertVideoRecord({
         ref,
         title: (edited.title || titleFromFileName(ref.originalName)).trim() || ref.originalName,
         categoryId,
@@ -141,6 +161,13 @@ export function UploadDialog({
         coverPath,
         folderHint: hint,
       });
+
+      // 4. 上传前批量打上的标签，跟着这条记录一起落库
+      const wantedTags = parseTagIds(edited.tagIdsCsv);
+      if (wantedTags.length > 0) {
+        // 标签失败不该让整条入库失败，转成「关联待重试」让用户看到
+        await setVideoTags(row.id, wantedTags);
+      }
     },
     onConfirmed: async (_ref, _context, flowScope) => {
       flowScope.assertCurrent();
@@ -153,6 +180,8 @@ export function UploadDialog({
       setEdits(new Map());
       claimedRef.current.clear();
       setDragOver(false);
+      setCheckedKeys(new Set());
+      setTagPickerOpen(false);
     }
   }, [open]);
 
@@ -242,6 +271,7 @@ export function UploadDialog({
       title: titleFromFileName(f.name),
       categoryId: defaultCategoryId,
       folderHint: folderHintOf(f),
+      tagIdsCsv: "",
     }));
 
     setEdits((prev) => {
@@ -267,7 +297,10 @@ export function UploadDialog({
     })();
   };
 
-  const updateMeta = (key: string, patch: Partial<Pick<MetaData, "title" | "categoryId">>) => {
+  const updateMeta = (
+    key: string,
+    patch: Partial<Pick<MetaData, "title" | "categoryId" | "tagIdsCsv">>,
+  ) => {
     setEdits((prev) => {
       const entry = prev.get(key);
       if (!entry) return prev;
@@ -277,6 +310,36 @@ export function UploadDialog({
   };
 
   const canClose = !queue.blocked;
+
+  /** 队列条目勾选（confirmed 的已入库，不再参与批量打标签） */
+  const checkableItems = items.filter((i) => i.state !== "confirmed");
+  const allChecked = checkableItems.length > 0 && checkableItems.every((i) => checkedKeys.has(i.context.data.key));
+
+  const toggleChecked = (key: string) => {
+    setCheckedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  /** 把标签打进选中条目的 meta，associate 时随入库一起写 */
+  const applyTagsToChecked = (tagIds: string[]) => {
+    let applied = 0;
+    setEdits((prev) => {
+      const next = new Map(prev);
+      for (const key of checkedKeys) {
+        const entry = next.get(key);
+        if (!entry) continue;
+        const merged = Array.from(new Set([...parseTagIds(entry.meta.tagIdsCsv), ...tagIds]));
+        next.set(key, { ...entry, meta: { ...entry.meta, tagIdsCsv: merged.join(",") } });
+        applied += 1;
+      }
+      return next;
+    });
+    toast.success(`已给 ${applied} 个待上传视频加上标签，上传完成后自动入库`);
+  };
 
   return (
     <Dialog
@@ -404,7 +467,64 @@ export function UploadDialog({
 
           {/* 上传队列 */}
           {items.length > 0 && (
-            <ul className="mt-4 space-y-2.5">
+            <div className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-border/70 bg-secondary/40 px-3 py-2">
+              <span className="text-xs text-muted-foreground">勾选条目可批量设分类 / 打标签</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 rounded-full text-xs"
+                onClick={() =>
+                  setCheckedKeys(
+                    allChecked ? new Set() : new Set(checkableItems.map((i) => i.context.data.key)),
+                  )
+                }
+                disabled={checkableItems.length === 0}
+              >
+                {allChecked ? "取消全选" : "全选"}
+              </Button>
+              <span className="text-xs tabular-nums text-muted-foreground">
+                已选 {checkedKeys.size}
+              </span>
+              {/* 勾选的队列条目批量设分类（分类单选，整批改成同一个）；选完 remount 回到占位态 */}
+              <Select
+                key={catPickerKey}
+                onValueChange={(v) => {
+                  const target = v === CATEGORY_NONE ? null : v;
+                  const n = checkedKeys.size;
+                  for (const key of checkedKeys) updateMeta(key, { categoryId: target });
+                  setCatPickerKey((k) => k + 1);
+                  toast.success(
+                    `已把 ${n} 条队列项设为「${categories.find((c) => c.id === target)?.name ?? "未分类"}」`,
+                  );
+                }}
+                disabled={checkedKeys.size === 0}
+              >
+                <SelectTrigger
+                  className="h-7 w-auto min-w-[7rem] rounded-full border-border bg-card px-2.5 text-xs"
+                  aria-label="给勾选的条目设置分类"
+                >
+                  <SelectValue placeholder="批量设分类" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={CATEGORY_NONE}>未分类</SelectItem>
+                  {categories.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 rounded-full text-xs"
+                onClick={() => setTagPickerOpen(true)}
+                disabled={checkedKeys.size === 0}
+              >
+                <Tag className="h-3.5 w-3.5" /> 给选中项打标签
+              </Button>
+            </div>
+          )}
+          {items.length > 0 && (
+            <ul className="mt-2.5 space-y-2.5">
               {items.map((item) => {
                 const entry = edits.get(item.context.data.key);
                 const meta = entry?.meta;
@@ -417,6 +537,22 @@ export function UploadDialog({
                     className="rounded-xl border border-border/70 bg-card p-3 shadow-soft"
                   >
                     <div className="flex items-start gap-2.5">
+                      {item.state !== "confirmed" && (
+                        <button
+                          type="button"
+                          aria-label={`选择 ${displayName} 进行批量打标签`}
+                          aria-pressed={checkedKeys.has(item.context.data.key)}
+                          onClick={() => toggleChecked(item.context.data.key)}
+                          className={
+                            "mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full border-2 transition-colors " +
+                            (checkedKeys.has(item.context.data.key)
+                              ? "border-film bg-film text-primary-foreground"
+                              : "border-border text-transparent hover:border-film/60")
+                          }
+                        >
+                          <Check className="h-3 w-3" />
+                        </button>
+                      )}
                       <StateIcon state={item.state} />
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -455,6 +591,22 @@ export function UploadDialog({
                             </span>
                           )}
                         </p>
+
+                        {(() => {
+                          const ids = parseTagIds(meta?.tagIdsCsv);
+                          if (ids.length === 0) return null;
+                          const names = ids
+                            .map((id) => tags.find((t) => t.id === id)?.name)
+                            .filter((n): n is string => Boolean(n));
+                          if (names.length === 0) return null;
+                          return (
+                            <p className="mt-1.5 flex flex-wrap items-center gap-1">
+                              {names.map((n) => (
+                                <TagPill key={n} name={n} />
+                              ))}
+                            </p>
+                          );
+                        })()}
 
                         {(busy || item.state === "queued") && (
                           <div className="mt-2">
@@ -544,6 +696,19 @@ export function UploadDialog({
           </div>
         </div>
       </DialogContent>
+
+      <TagPickerDialog
+        open={tagPickerOpen}
+        onOpenChange={setTagPickerOpen}
+        tags={tags}
+        mode="add"
+        title="给选中的待上传视频打标签"
+        description={`将对 ${checkedKeys.size} 个视频生效，上传完成入库时自动写入`}
+        onEnsureTag={onEnsureTag}
+        onConfirm={async (tagIds) => {
+          applyTagsToChecked(tagIds);
+        }}
+      />
     </Dialog>
   );
 }
