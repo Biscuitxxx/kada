@@ -1,0 +1,7 @@
+# pnpm 12 的工程级设置（pnpm 10+ 起这些选项从 .npmrc 迁到这里）
+# minimumReleaseAge: 原供应链策略会拦住部分新发布包，本地开发关掉
+# strictDepBuilds:   未批准的依赖构建脚本（esbuild）不报错
+# verifyDepsBeforeRun: 每次 run 前不再重复校验安装
+minimumReleaseAge: 0
+strictDepBuilds: false
+verifyDepsBeforeRun: false

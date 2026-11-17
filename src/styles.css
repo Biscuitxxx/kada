@@ -1,0 +1,204 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ── 胶片蓝调 · 个人视频库 design tokens ─────────────────────── */
+:root {
+  --radius: 0.875rem;
+
+  /* 页面基底：极浅冷灰蓝，干净通透 */
+  --background: oklch(0.975 0.008 250);
+  --foreground: oklch(0.24 0.03 258);
+
+  --card: oklch(0.995 0.004 250);
+  --card-foreground: oklch(0.24 0.03 258);
+
+  --popover: oklch(0.995 0.006 250);
+  --popover-foreground: oklch(0.24 0.03 258);
+
+  /* 主色：饱和胶片蓝 */
+  --primary: oklch(0.52 0.16 258);
+  --primary-foreground: oklch(0.98 0.01 250);
+
+  --secondary: oklch(0.94 0.02 250);
+  --secondary-foreground: oklch(0.32 0.05 258);
+
+  --muted: oklch(0.945 0.012 250);
+  --muted-foreground: oklch(0.53 0.025 255);
+
+  --accent: oklch(0.92 0.045 252);
+  --accent-foreground: oklch(0.3 0.07 258);
+
+  --destructive: oklch(0.58 0.2 25);
+  --destructive-foreground: oklch(0.98 0.01 250);
+
+  --border: oklch(0.9 0.014 250);
+  --input: oklch(0.91 0.014 250);
+  --ring: oklch(0.52 0.16 258);
+
+  /* 品牌扩展色 */
+  --film: oklch(0.52 0.16 258);          /* 胶片蓝 */
+  --film-deep: oklch(0.36 0.12 262);     /* 深蓝（横幅渐变终点） */
+  --film-sky: oklch(0.72 0.1 245);       /* 浅天蓝（横幅渐变起点） */
+  --amber-reel: oklch(0.78 0.14 75);     /* 放映机琥珀（时长角标点缀） */
+  --surface-glass: oklch(0.99 0.005 250 / 0.72);
+
+  --shadow-soft: 0 1px 2px oklch(0.3 0.05 258 / 0.05), 0 8px 24px -12px oklch(0.3 0.05 258 / 0.14);
+  --shadow-lift: 0 2px 4px oklch(0.3 0.05 258 / 0.08), 0 18px 40px -16px oklch(0.35 0.1 258 / 0.28);
+
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 10px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-film: var(--film);
+  --color-film-deep: var(--film-deep);
+  --color-film-sky: var(--film-sky);
+  --color-amber-reel: var(--amber-reel);
+  --color-surface-glass: var(--surface-glass);
+
+  --shadow-soft: var(--shadow-soft);
+  --shadow-lift: var(--shadow-lift);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    overscroll-behavior-y: none;
+  }
+  /* 移动端隐藏横向滚动条但保留滚动 */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@layer components {
+  /* 顶部玻璃导航栏 */
+  .app-header {
+    background: var(--surface-glass);
+    backdrop-filter: blur(14px) saturate(1.4);
+    -webkit-backdrop-filter: blur(14px) saturate(1.4);
+    border-bottom: 1px solid oklch(0.3 0.05 258 / 0.07);
+  }
+
+  /* 横幅渐变底（生图失败也可优雅降级） */
+  .hero-base {
+    background:
+      radial-gradient(120% 140% at 85% 0%, oklch(0.72 0.1 245 / 0.55) 0%, transparent 55%),
+      linear-gradient(135deg, oklch(0.42 0.13 262) 0%, oklch(0.3 0.09 265) 100%);
+  }
+
+  /* 卡片悬浮微动作 —— 只用于视频卡片 */
+  .clip-card {
+    transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.25s ease;
+    box-shadow: var(--shadow-soft);
+  }
+  .clip-card:hover {
+    transform: translateY(-3px);
+    box-shadow: var(--shadow-lift);
+  }
+
+  /* 分类胶囊 */
+  .chip {
+    @apply inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-sm transition-colors select-none cursor-pointer;
+    border-color: var(--color-border);
+    background: var(--color-card);
+    color: var(--color-muted-foreground);
+  }
+  .chip:hover {
+    border-color: oklch(0.52 0.16 258 / 0.4);
+    color: var(--color-foreground);
+  }
+  .chip[data-active="true"] {
+    background: var(--color-film);
+    border-color: var(--color-film);
+    color: var(--color-primary-foreground);
+    box-shadow: 0 4px 14px -4px oklch(0.52 0.16 258 / 0.5);
+  }
+
+  /* 时长角标 */
+  .duration-badge {
+    @apply pointer-events-none absolute bottom-2 right-2 rounded-md px-1.5 py-0.5 text-[11px] font-medium tabular-nums;
+    background: oklch(0.18 0.03 260 / 0.78);
+    color: oklch(0.97 0.01 250);
+    backdrop-filter: blur(4px);
+  }
+
+  /* 播放浮标 */
+  .play-float {
+    @apply pointer-events-none absolute inset-0 grid place-items-center opacity-0 transition-opacity duration-300;
+  }
+  .clip-card:hover .play-float,
+  .clip-card:focus-visible .play-float {
+    opacity: 1;
+  }
+  .play-float > span {
+    @apply grid h-12 w-12 place-items-center rounded-full;
+    background: oklch(0.98 0.01 250 / 0.92);
+    color: var(--color-film);
+    box-shadow: 0 6px 20px -6px oklch(0.1 0.02 260 / 0.5);
+  }
+
+  /* 上传进度条动画 */
+  @keyframes progress-shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  .progress-bar {
+    background-image: linear-gradient(
+      90deg,
+      var(--color-film) 0%,
+      var(--color-film-sky) 45%,
+      var(--color-film) 90%
+    );
+    background-size: 200% 100%;
+    animation: progress-shimmer 1.6s linear infinite;
+  }
+
+  /* 空态呼吸浮动 */
+  @keyframes float-bob {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-8px); }
+  }
+  .float-bob {
+    animation: float-bob 3.2s ease-in-out infinite;
+  }
+}
