@@ -109,6 +109,14 @@ export function UploadDialog({
   /** 队列里勾选的条目，用于批量打标签 */
   const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
   const [tagPickerOpen, setTagPickerOpen] = useState(false);
+  /** 标签弹窗这次是给「本批默认」用的，还是给「勾选的条目」用的 */
+  const [tagPickerTarget, setTagPickerTarget] = useState<"batch" | "checked">("checked");
+  /**
+   * 本批默认：上传前就把这批的分类和标签定好，handleFiles 入队时直接写进每条 meta，
+   * 于是每个文件入库时就自带分类和标签，不用传完再回头一个个设。
+   */
+  const [batchCategoryId, setBatchCategoryId] = useState<string | null>(null);
+  const [batchTagIds, setBatchTagIds] = useState<string[]>([]);
   // 批量设分类的 Select 用 key 重置回占位态（Radix 不接受空字符串 value）
   const [catPickerKey, setCatPickerKey] = useState(0);
   const editsBridge = useRef(edits);
@@ -182,6 +190,9 @@ export function UploadDialog({
       setDragOver(false);
       setCheckedKeys(new Set());
       setTagPickerOpen(false);
+      setTagPickerTarget("checked");
+      setBatchCategoryId(null);
+      setBatchTagIds([]);
     }
   }, [open]);
 
@@ -269,9 +280,10 @@ export function UploadDialog({
     const metas: MetaData[] = picked.map((f) => ({
       key: `v${++keySeq}`,
       title: titleFromFileName(f.name),
-      categoryId: defaultCategoryId,
+      // 上传前选的本批分类/标签优先；没选就走原来的默认分类 + 文件夹推断
+      categoryId: batchCategoryId ?? defaultCategoryId,
       folderHint: folderHintOf(f),
-      tagIdsCsv: "",
+      tagIdsCsv: batchTagIds.join(","),
     }));
 
     setEdits((prev) => {
@@ -310,6 +322,41 @@ export function UploadDialog({
   };
 
   const canClose = !queue.blocked;
+
+  /** 队列里还没开始传的条目（能安全修改它们 meta 的就这些） */
+  const editableKeys = items.filter((i) => i.state === "queued").map((i) => i.context.data.key);
+
+  /** 本批分类：改了就同步给队列里还没开始传的条目，让清单上的下拉和实际入库保持一致 */
+  const applyBatchCategory = (value: string) => {
+    const target = value === CATEGORY_NONE ? null : value;
+    setBatchCategoryId(target);
+    if (editableKeys.length === 0) return;
+    setEdits((prev) => {
+      const next = new Map(prev);
+      for (const key of editableKeys) {
+        const entry = next.get(key);
+        if (!entry) continue;
+        next.set(key, { ...entry, meta: { ...entry.meta, categoryId: target } });
+      }
+      return next;
+    });
+  };
+
+  /** 本批标签：整批替换（不是追加），并同步给还没开始传的条目 */
+  const setBatchTags = (tagIds: string[]) => {
+    const unique = Array.from(new Set(tagIds));
+    setBatchTagIds(unique);
+    if (editableKeys.length === 0) return;
+    setEdits((prev) => {
+      const next = new Map(prev);
+      for (const key of editableKeys) {
+        const entry = next.get(key);
+        if (!entry) continue;
+        next.set(key, { ...entry, meta: { ...entry.meta, tagIdsCsv: unique.join(",") } });
+      }
+      return next;
+    });
+  };
 
   /** 队列条目勾选（confirmed 的已入库，不再参与批量打标签） */
   const checkableItems = items.filter((i) => i.state !== "confirmed");
@@ -465,10 +512,72 @@ export function UploadDialog({
             />
           </div>
 
+          {/* 本批默认：上传前先定好分类和标签，后面的文件自动带上 */}
+          <div className="mt-3 rounded-xl border border-film/25 bg-accent/40 px-3 py-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold text-film-deep">上传前先定好</span>
+              <Select value={batchCategoryId ?? CATEGORY_NONE} onValueChange={applyBatchCategory}>
+                <SelectTrigger
+                  className="h-8 w-auto min-w-[7.5rem] rounded-full border-border bg-card px-2.5 text-xs"
+                  aria-label="本批视频的分类"
+                >
+                  <SelectValue placeholder="选择分类" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={CATEGORY_NONE}>不指定分类</SelectItem>
+                  {categories.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-8 rounded-full bg-card text-xs"
+                onClick={() => {
+                  setTagPickerTarget("batch");
+                  setTagPickerOpen(true);
+                }}
+              >
+                <Tag className="h-3.5 w-3.5" />
+                {batchTagIds.length > 0 ? `再加标签（已选 ${batchTagIds.length}）` : "选择标签"}
+              </Button>
+              {batchTagIds.map((id) => {
+                const name = tags.find((t) => t.id === id)?.name;
+                if (!name) return null;
+                return (
+                  <button
+                    type="button"
+                    key={id}
+                    onClick={() => setBatchTags(batchTagIds.filter((x) => x !== id))}
+                    className="rounded-full transition-opacity hover:opacity-70"
+                    aria-label={`去掉标签 ${name}`}
+                    title="点一下去掉这个标签"
+                  >
+                    <TagPill name={name} />
+                  </button>
+                );
+              })}
+              {batchTagIds.length > 0 && (
+                <button
+                  type="button"
+                  className="text-[11px] text-muted-foreground underline transition-colors hover:text-foreground"
+                  onClick={() => setBatchTags([])}
+                >
+                  清空标签
+                </button>
+              )}
+            </div>
+            <p className="mt-1.5 text-[11px] text-muted-foreground">
+              选好后，这批每个视频入库时就带上这些分类和标签；上传完成后也能逐条改。
+            </p>
+          </div>
+
           {/* 上传队列 */}
           {items.length > 0 && (
             <div className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-border/70 bg-secondary/40 px-3 py-2">
-              <span className="text-xs text-muted-foreground">勾选条目可批量设分类 / 打标签</span>
+              <span className="text-xs text-muted-foreground">已入库的想微调：勾选条目后批量改</span>
               <Button
                 size="sm"
                 variant="ghost"
@@ -516,7 +625,10 @@ export function UploadDialog({
                 size="sm"
                 variant="outline"
                 className="h-7 rounded-full text-xs"
-                onClick={() => setTagPickerOpen(true)}
+                onClick={() => {
+                  setTagPickerTarget("checked");
+                  setTagPickerOpen(true);
+                }}
                 disabled={checkedKeys.size === 0}
               >
                 <Tag className="h-3.5 w-3.5" /> 给选中项打标签
@@ -702,11 +814,20 @@ export function UploadDialog({
         onOpenChange={setTagPickerOpen}
         tags={tags}
         mode="add"
-        title="给选中的待上传视频打标签"
-        description={`将对 ${checkedKeys.size} 个视频生效，上传完成入库时自动写入`}
+        title={tagPickerTarget === "batch" ? "给这批视频选标签" : "给选中的待上传视频打标签"}
+        description={
+          tagPickerTarget === "batch"
+            ? "选中的标签会跟着这批每个视频一起入库；之后新选的视频也会自动带上"
+            : `将对 ${checkedKeys.size} 个视频生效，上传完成入库时自动写入`
+        }
         onEnsureTag={onEnsureTag}
         onConfirm={async (tagIds) => {
-          applyTagsToChecked(tagIds);
+          if (tagPickerTarget === "batch") {
+            // mode="add" 只回传这次勾的，所以是"并到已有"而不是覆盖
+            setBatchTags([...batchTagIds, ...tagIds]);
+          } else {
+            applyTagsToChecked(tagIds);
+          }
         }}
       />
     </Dialog>

@@ -332,7 +332,9 @@ function probeVideo(file: File): Promise<ProbeResult> {
       window.setTimeout(grab, 1200);
     });
     video.addEventListener("error", () => finish({ duration: null, coverBlob: null }));
-    window.setTimeout(() => finish({ duration: null, coverBlob: null }), 15000);
+    // 15s → 6s：HEVC 这类浏览器解不了的编码会一直挂着，等下去没意义，
+    // 封面和时长交给服务端的 ffmpeg 兜底（server/api.mjs 的 ensureCover）
+    window.setTimeout(() => finish({ duration: null, coverBlob: null }), 6000);
     video.src = url;
   });
 }

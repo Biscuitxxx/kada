@@ -419,7 +419,8 @@ function createVideo(payload) {
     row.size_bytes, row.duration_seconds, row.cover_path, row.folder_hint, row.created_at,
     null, null,
   );
-  queueTranscodeIfNeeded(row.id);
+  // 入库后做两件后台事：缺封面就补（前端 canvas 解不了 HEVC），需要网页版就排队转码
+  postProcessVideo(row.id);
   return getVideo(row.id);
 }
 
@@ -543,7 +544,7 @@ async function probeStream(file) {
   const r = await spawnCapture(FFPROBE, [
     "-v", "error",
     "-select_streams", "v:0",
-    "-show_entries", "stream=codec_name,width,height,pix_fmt",
+    "-show_entries", "stream=codec_name,width,height,pix_fmt,color_transfer",
     "-of", "json",
     file,
   ]);
@@ -556,11 +557,164 @@ async function probeStream(file) {
       codec: String(stream.codec_name).toLowerCase(),
       width: Number(stream.width) || 0,
       height: Number(stream.height) || 0,
+      transfer: String(stream.color_transfer ?? "").toLowerCase(),
     };
   } catch {
     return null;
   }
 }
+
+/** HDR 传输特性：这类片子直接抽帧会发灰发暗，要先做色调映射。 */
+const HDR_TRANSFERS = new Set(["smpte2084", "arib-std-b67"]);
+
+/* ------------------------------------------------------------------ *
+ * 封面 + 时长（服务端兜底）
+ *
+ * 上传时前端会用 <video> + canvas 抽一张封面，但浏览器解不了 HEVC/H.265，
+ * 这类文件抽出来是空的（卡片只能显示胶片图标 + 短横线）。
+ * 所以这里用 ffmpeg 再补一遍：前端成功的直接跳过，失败的兜底。
+ * ------------------------------------------------------------------ */
+
+/** 读总时长（秒）；读不到返回 0。 */
+async function probeDuration(file) {
+  const r = await spawnCapture(FFPROBE, [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "json",
+    file,
+  ]);
+  if (r.code !== 0) return 0;
+  try {
+    const duration = Number(JSON.parse(r.out)?.format?.duration);
+    return Number.isFinite(duration) && duration > 0 ? duration : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** 某一时刻画面的平均亮度（0-255）；读不到返回 -1。用来判断是不是黑场。 */
+async function frameLuma(file, sec) {
+  const r = await spawnCapture(FFMPEG, [
+    "-hide_banner",
+    "-ss", sec.toFixed(3),
+    "-i", file,
+    "-frames:v", "1",
+    // 缩到 1 像素 + 灰度，再用 signalstats 打一个 YAVG（平均亮度）出来
+    "-vf", "scale=1:1,format=gray,signalstats,metadata=print:key=lavfi.signalstats.YAVG",
+    "-f", "null",
+    "-",
+  ]);
+  const match = /lavfi\.signalstats\.YAVG=([0-9.]+)/.exec(`${r.err}\n${r.out}`);
+  return match ? Number(match[1]) : -1;
+}
+
+/** 抽一帧存成 JPEG（640 宽、等比缩放）。HDR 片先做色调映射，否则图会灰蒙蒙。 */
+async function extractCover(file, sec, outPath, hdr = false) {
+  const plainVf = "scale=640:-2";
+  const hdrVf =
+    "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0," +
+    "zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=640:-2";
+  const run = (vf) =>
+    spawnCapture(FFMPEG, [
+      "-y", "-v", "error",
+      "-ss", sec.toFixed(3),
+      "-i", file,
+      "-frames:v", "1",
+      "-vf", vf,
+      "-q:v", "3",
+      outPath,
+    ]);
+  let r = await run(hdr ? hdrVf : plainVf);
+  if (r.code !== 0 && hdr) r = await run(plainVf); // 色调映射失败就退回普通抽帧
+  return r.code === 0;
+}
+
+/**
+ * 缺封面就补：挑一个不太暗的时间点抽帧，写 <原文件>.cover.jpg，顺便补齐 duration。
+ * 已有封面 / 对象里已经存在封面文件时直接写库，不重抽。
+ * 返回 true 表示最终有了封面。
+ */
+async function ensureCover(videoId) {
+  const row = db
+    .prepare("SELECT storage_path, cover_path, duration_seconds FROM videos WHERE id = ?")
+    .get(videoId);
+  if (!row) return false;
+  const file = await locateObjectPath(row.storage_path);
+  if (!file) return false;
+
+  const coverKey = row.cover_path || `${row.storage_path}.cover.jpg`;
+  const coverAbs = `${file}.cover.jpg`;
+
+  let duration = Number(row.duration_seconds) || 0;
+  if (!duration) duration = await probeDuration(file);
+
+  let haveCover = Boolean(row.cover_path);
+  if (!haveCover) {
+    const preExisting = await locateObjectPath(coverKey);
+    if (preExisting) {
+      haveCover = true;
+    } else {
+      // HDR 片抽帧会发灰，先判一下要不要做色调映射
+      const stream = await probeStream(file);
+      const isHdr = HDR_TRANSFERS.has(stream?.transfer ?? "");
+      // 默认取 1.5s（短视频取 10% 处），片头淡入黑场时往后再试几个点，取最亮的
+      const baseSeek = duration > 15 ? 1.5 : Math.max(0.1, duration * 0.1);
+      let bestSec = baseSeek;
+      let bestLuma = await frameLuma(file, baseSeek);
+      if (bestLuma >= 0 && bestLuma < 40 && duration > 3) {
+        for (const ratio of [0.15, 0.25, 0.35, 0.5, 0.7]) {
+          const sec = duration * ratio;
+          const luma = await frameLuma(file, sec);
+          if (luma > bestLuma) {
+            bestLuma = luma;
+            bestSec = sec;
+          }
+          if (luma >= 110) break;
+        }
+      }
+      let ok = await extractCover(file, bestSec, coverAbs, isHdr);
+      if (!ok) ok = await extractCover(file, 0, coverAbs, false); // 兜底首帧
+      if (!ok) return false;
+      haveCover = true;
+      console.log(
+        `[cover] 补封面 ${videoId} @ ${bestSec.toFixed(1)}s（亮度 ${Math.round(bestLuma)}${isHdr ? "，HDR 已映射" : ""}）`,
+      );
+    }
+  }
+
+  db.prepare("UPDATE videos SET cover_path = ?, duration_seconds = ? WHERE id = ?").run(
+    haveCover ? coverKey : row.cover_path ?? null,
+    duration > 0 ? duration : row.duration_seconds ?? null,
+    videoId,
+  );
+  return haveCover;
+}
+
+/** 存量补封面：逐条补缺的，串行跑，避免抢 CPU。 */
+async function backfillMissingCovers() {
+  const rows = db.prepare("SELECT id, cover_path FROM videos").all();
+  let fixed = 0;
+  let had = 0;
+  let failed = 0;
+  for (const row of rows) {
+    if (row.cover_path) {
+      // 封面字段有，但时长可能缺，顺手补一下
+      const dur = db
+        .prepare("SELECT duration_seconds FROM videos WHERE id = ?")
+        .get(row.id)?.duration_seconds;
+      if (!dur) {
+        await ensureCover(row.id);
+        had++;
+      }
+      continue;
+    }
+    const ok = await ensureCover(row.id);
+    if (ok) fixed++;
+    else failed++;
+  }
+  return { ok: true, checked: rows.length, fixed, had_cover: had, failed };
+}
+
 
 function setProxyStatus(id, status, proxyPath) {
   if (proxyPath === undefined) {
@@ -623,6 +777,12 @@ async function transcodeOne(videoId) {
   console.log(
     `[transcode] 完成 ${videoId}，${Math.round((Date.now() - started) / 1000)}s，${(stat.size / 1048576).toFixed(1)}MB`,
   );
+  // 转出来的这份是 H.264，抽帧百分百能成；万一前面没补上封面，这里再兜一次
+  try {
+    await ensureCover(videoId);
+  } catch (cause) {
+    console.error("[cover] 转码后补封面失败:", cause?.message ?? cause);
+  }
 }
 
 async function drainTranscodeQueue() {
@@ -669,6 +829,21 @@ function queueTranscodeIfNeeded(videoId) {
     } catch (cause) {
       console.error("[transcode] 入队判定失败:", cause?.message ?? cause);
     }
+  });
+}
+
+/**
+ * 入库后的后台处理：先补封面（用户几秒内就能看到图），再判编码决定要不要转网页版。
+ * 两步互不影响，任何一步挂了都不影响记录本身。
+ */
+function postProcessVideo(videoId) {
+  setImmediate(async () => {
+    try {
+      await ensureCover(videoId);
+    } catch (cause) {
+      console.error("[cover] 补封面失败:", cause?.message ?? cause);
+    }
+    queueTranscodeIfNeeded(videoId);
   });
 }
 
@@ -792,6 +967,22 @@ const server = createServer(async (req, res) => {
       if (req.method === "POST" && id === "bulk-category") {
         const body = await readJsonBody(req);
         sendJson(res, 200, bulkSetCategory(body.video_ids, body.category_id ?? null));
+        return;
+      }
+      // POST /api/videos/backfill-covers —— 存量补封面（缺封面/缺时长的都补，后台串行跑）
+      if (req.method === "POST" && id === "backfill-covers") {
+        setImmediate(() => {
+          backfillMissingCovers()
+            .then((result) => {
+              console.log(
+                `[cover] 存量补封面完成：检查 ${result.checked}，补上 ${result.fixed}，补时长 ${result.had_cover}，失败 ${result.failed}`,
+              );
+            })
+            .catch((cause) => {
+              console.error("[cover] 存量补封面失败:", cause?.message ?? cause);
+            });
+        });
+        sendJson(res, 202, { ok: true, started: true });
         return;
       }
       // POST /api/videos/web-version-all —— 存量扫描：给浏览器放不了的编码排队转网页版

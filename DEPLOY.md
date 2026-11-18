@@ -178,13 +178,16 @@ curl -s http://127.0.0.1:3015/api/videos | python3 -c 'import json,sys,collectio
 
 ## 8. 转码链路（换机后要点一遍的地方）
 
+- **封面和时长也由服务端生成**：入库后后台 `ensureCover` 用 ffmpeg 抽帧（片头黑场会自动换时间点取亮帧，HDR 先做色调映射），
+  缺就补、有就跳过；前端 canvas 只负责「能抽就先抽一张」。所以 **ffmpeg 不只是转码需要，封面也需要**。
 - 判定：入库时后台 `ffprobe` 读视频轨 `codec_name`；`h264/vp9/av01/theora/mpeg4` → `proxy_status=null`（不动），其它 → 排队。
 - 队列串行，一次一个 ffmpeg，避免几路同时吃满 CPU。
 - 参数：`libx264 -preset veryfast -crf 26 -pix_fmt yuv420p`、`aac 128k -ac 2`、`+faststart`；
   源高度 > 1080 先 `scale=-2:1080`。
 - 产物 `<原文件名>.web.mp4`，**原片一个字节都不动**；已经存在就秒标 `ready`，不重跑。
 - 字段：`proxy_path` / `proxy_status`（`NULL / pending / processing / ready / failed`），启动时自动 `ALTER TABLE` 补列。
-- 接口：`POST /api/videos/:id/web-version`（单条）、`POST /api/videos/web-version-all`（存量扫描）。
+- 接口：`POST /api/videos/:id/web-version`（单条）、`POST /api/videos/web-version-all`（存量扫描），
+  `POST /api/videos/backfill-covers`（存量补封面+时长，幂等，重复跑不会重抽）。
 
 **强制重转某条**（比如调了 CRF 想重新压）：
 
@@ -206,33 +209,53 @@ ffmpeg -i <源>.mp4 -c:v libx264 -preset veryfast -crf 26 -pix_fmt yuv420p \
 
 ---
 
-## 9. 开机自启（本机尚未启用，可选）
+## 9. 开机自启（本机已启用）
 
-当前是靠手动 `nohup pnpm local &` 起的，**重启后会停**。要开机自启：
+本机现在由 **systemd 用户级服务** `kada.service` 托管，开机自动启动，不需要登录。
+
+```bash
+# 状态 / 开关
+systemctl --user status kada.service
+systemctl --user restart kada.service     # 改了 server/*.mjs 之后需要这个
+systemctl --user stop kada.service
+systemctl --user start kada.service
+
+# 是否开机自启 / 是否已在跑
+systemctl --user is-enabled kada.service  # enabled
+systemctl --user is-active kada.service   # active
+```
+
+服务定义在 `~/.config/systemd/user/kada.service`，仓库里同名副本是 `deploy/kada.service`（换机时直接装）。
+
+关键配置：
+
+| 项 | 值 | 为什么 |
+| --- | --- | --- |
+| `WorkingDirectory` | `%h/kada` | 项目根 |
+| `Environment=PATH` | 含 `%h/.local/node22/bin` | systemd 不读 `.bashrc`，必须显式给 node/pnpm 路径 |
+| `ExecStart` | `%h/.local/node22/bin/pnpm local` | 直接用绝对路径，不依赖 login shell |
+| `Restart=always` + `RestartSec=3` | 进程崩了 3 秒后重拉 | 和 dev-all 内部的自动重启互补 |
+| `KillMode=control-group` | 停服务时清理整棵进程树 | 否则 vite / api / object-store 会残留 |
+| `StandardOutput/Error=append:%h/kada-local.log` | 日志仍写到老地方 | 习惯不变，`grep -a` 照旧可用 |
+
+`loginctl enable-linger xxx` 已开启（`Linger=yes`），所以**不用登录桌面也会开机自启**；没开 linger 的话，用户级服务只在你登录后才起来，这是最容易漏的一步。
+
+换机时：
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cat > ~/.config/systemd/user/kada.service <<'EOF'
-[Unit]
-Description=kada local video library
-After=network.target
-
-[Service]
-WorkingDirectory=%h/kada
-Environment=PATH=%h/.local/node22/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/bin/bash -lc 'pnpm local'
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-EOF
+cp ~/kada/deploy/kada.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now kada.service
-loginctl enable-linger $USER      # 不登录也能起
+loginctl enable-linger $USER
 ```
 
-`systemctl --user status kada` 看状态，日志 `journalctl --user -u kada -f`。
+日志同时看两个地方：
+
+```bash
+tail -f ~/kada-local.log                  # 业务日志（老习惯）
+systemctl --user status kada.service      # 进程有没有被 systemd 拉起
+```
 
 ---
 
@@ -245,7 +268,7 @@ loginctl enable-linger $USER      # 不登录也能起
 | 代码 | — | `pnpm install` |
 | 数据 | — | 解压 `.data` 到项目根 |
 | 配置 | 记下 `.env.local` 的 `VITE_S3_ENDPOINT` | 按新机 IP 重写，**不能是 127.0.0.1** |
-| 启动 | `pkill -f dev-all` | `nohup pnpm local &` |
+| 启动 | `pkill -f dev-all` | `cp deploy/kada.service ~/.config/systemd/user/ && systemctl --user enable --now kada.service && loginctl enable-linger $USER`（见第 9 节；临时调试也可 `nohup pnpm local &`） |
 | 验证 | — | 第 6 节 7 条自检 |
 | 存量补转 | — | `curl -X POST .../api/videos/web-version-all`（新机若 `.data` 里已有 `.web.mp4`，会秒标 ready，不会重跑） |
 | 封面缺失 | — | `node scripts/backfill-covers.mjs --apply` |

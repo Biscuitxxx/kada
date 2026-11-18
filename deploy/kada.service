@@ -1,0 +1,20 @@
+[Unit]
+Description=Kada video library (3015 web / 8787 api / 9000 object store)
+Documentation=file:///home/xxx/kada/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/kada
+Environment=PATH=%h/.local/node22/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=%h/.local/node22/bin/pnpm local
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
+StandardOutput=append:%h/kada-local.log
+StandardError=append:%h/kada-local.log
+
+[Install]
+WantedBy=default.target

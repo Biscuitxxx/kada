@@ -444,17 +444,30 @@ EOF
 
 本次实测：73 条里 9 条是 `hvc1`，其余是 `avc1`。
 
-### 补封面 / 补时长（一次性脚本，已跑过）
+### 补封面 / 补时长（**现在全自动**，2026-11-17）
+
+早先是手工跑脚本补的，现在已经接进服务端，**新上传的视频不用再手动处理**：
+
+| 时机 | 谁来做 | 说明 |
+| --- | --- | --- |
+| 上传关联完成后 | 前端 canvas 试抽一次 | H.264 能抽出来就用，快（几百毫秒）；HEVC 抽不出来 → 留空 |
+| 入库后（后台几百毫秒） | 服务端 `ensureCover` | 缺封面就 `ffmpeg` 抽帧 + 补齐 `duration_seconds`；已有就跳过 |
+| 转码完成后 | 服务端 `ensureCover` | 再兜一次（此时源已是 H.264） |
+
+抽帧策略：默认取 1.5s 处；先用 `signalstats` 测亮度，**片头淡入黑场（亮度 < 40）就往 15%/25%/35%/50%/70% 再试几个点，取最亮的**，
+不会再出现一片全黑的封面。HDR 片（`smpte2084` / `arib-std-b67`）先做 `zscale + tonemap` 色调映射，否则抽出来发灰。
+
+存量补封面（不用跑脚本，直接调接口，后台串行跑）：
 
 ```bash
-sudo apt-get install -y ffmpeg          # 服务端第一次需要（本次装的 4.4.2）
-node scripts/backfill-covers.mjs         # dry-run：只探测，不写
-node scripts/backfill-covers.mjs --apply # 抽帧写 <原文件>.cover.jpg，并写回 duration_seconds / cover_path
+curl -s -X POST http://127.0.0.1:3015/api/videos/backfill-covers
+grep -a '存量补封面完成' ~/kada-local.log | tail -1
+# [cover] 存量补封面完成：检查 130，补上 13，补时长 0，失败 0
 ```
 
-- 直接打开 `.data/library.db`（`node:sqlite`，带 `busy_timeout`），只改 `cover_path`、`duration_seconds` 两个字段，
-  **不动视频文件**，也不改对象存储布局；封面就和原来一样落在 `<storage_path>.cover.jpg`。
-- 只处理 `cover_path` 或 `duration_seconds` 为空的记录，跑一次就够，不进启动流程、不做定时任务。
+跑第二次会是「补上 0」，可以当幂等检查。
+
+早期那个一次性脚本 `scripts/backfill-covers.mjs` 仍然保留（`--apply` 才写库），但已经不是必须的了。
 
 ### 还差的一步：在线播放
 
